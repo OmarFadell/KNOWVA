@@ -24,6 +24,13 @@ provision:
       objectId: BOT_OBJECT_ID
       tenantId: AAD_APP_TENANT_ID
 
+  # Apply the SSO scope (access_as_user), identifierUris, and Teams client
+  # pre-authorization from aad.manifest.json onto the Entra app created above.
+  - uses: aadApp/update
+    with:
+      manifestPath: ./aad.manifest.json
+      outputFilePath: ./build/aad.manifest.${{TEAMSFX_ENV}}.json
+
   # Replaces the template's botFramework/create.
   # A dev.botframework.com registration cannot carry an OAuth connection
   # setting, so local uses a real Azure Bot resource -- same as dev.

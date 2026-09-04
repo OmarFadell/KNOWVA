@@ -1,0 +1,65 @@
+{
+    "id": "afef5062-2c2d-4bcf-8d2c-8f4e36b24c84",
+    "appId": "02b07d52-9d40-405a-b339-dcd62e7e866b",
+    "name": "KNOWVAlocal",
+    "signInAudience": "AzureADMyOrg",
+    "accessTokenAcceptedVersion": 2,
+    "identifierUris": [
+        "api://botid-02b07d52-9d40-405a-b339-dcd62e7e866b"
+    ],
+    "requiredResourceAccess": [
+        {
+            "resourceAppId": "00000003-0000-0000-c000-000000000000",
+            "resourceAccess": [
+                {
+                    "id": "e1fe6dd8-ba31-4d61-89e7-88639da4683d",
+                    "type": "Scope"
+                }
+            ]
+        }
+    ],
+    "oauth2Permissions": [
+        {
+            "adminConsentDescription": "Allows Teams to call the app's web APIs as the current user.",
+            "adminConsentDisplayName": "Teams can access app's web APIs",
+            "id": "df199ebb-7e44-45fb-b3a7-cc1702c76499",
+            "isEnabled": true,
+            "type": "User",
+            "userConsentDescription": "Enable Teams to call this app's web APIs with the same rights that you have",
+            "userConsentDisplayName": "Teams can access app's web APIs and make requests on your behalf",
+            "value": "access_as_user"
+        }
+    ],
+    "preAuthorizedApplications": [
+        {
+            "appId": "1fec8e78-bce4-4aaf-ab1b-5451cc387264",
+            "permissionIds": [
+                "df199ebb-7e44-45fb-b3a7-cc1702c76499"
+            ]
+        },
+        {
+            "appId": "5e3ce6c0-2b1f-4285-8d4b-75ee78787346",
+            "permissionIds": [
+                "df199ebb-7e44-45fb-b3a7-cc1702c76499"
+            ]
+        },
+        {
+            "appId": "4345a7b9-9a63-4910-a426-35363201d503",
+            "permissionIds": [
+                "df199ebb-7e44-45fb-b3a7-cc1702c76499"
+            ]
+        },
+        {
+            "appId": "bc59ab01-8403-45c6-8796-ac3ef710b3e3",
+            "permissionIds": [
+                "df199ebb-7e44-45fb-b3a7-cc1702c76499"
+            ]
+        },
+        {
+            "appId": "d3590ed6-52b3-4102-aeff-aad2292ab01c",
+            "permissionIds": [
+                "df199ebb-7e44-45fb-b3a7-cc1702c76499"
+            ]
+        }
+    ]
+}

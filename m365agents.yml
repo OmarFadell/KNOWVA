@@ -30,6 +30,13 @@ provision:
       objectId: BOT_OBJECT_ID
       tenantId: AAD_APP_TENANT_ID
 
+  # Apply the SSO scope (access_as_user), identifierUris, and Teams client
+  # pre-authorization from aad.manifest.json onto the Entra app created above.
+  - uses: aadApp/update
+    with:
+      manifestPath: ./aad.manifest.json
+      outputFilePath: ./build/aad.manifest.${{TEAMSFX_ENV}}.json
+
   - uses: arm/deploy # Deploy given ARM templates parallelly.
     with:
       # AZURE_SUBSCRIPTION_ID is a built-in environment variable,
