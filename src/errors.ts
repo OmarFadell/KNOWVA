@@ -22,6 +22,14 @@ export function describeError(err: unknown): Record<string, unknown> {
     described.responseData = e.response.data;
   }
 
+  // Anthropic SDK errors put the status on `status` (not `statusCode`), the
+  // parsed body on `error`, and a request id that Anthropic support asks for.
+  if (described.httpStatus === undefined && e?.status !== undefined) {
+    described.httpStatus = e.status;
+  }
+  if (e?.error !== undefined) described.errorBody = e.error;
+  if (e?.request_id !== undefined) described.requestId = e.request_id;
+
   // Graph and the Bot Framework token service both hide the real reason here.
   const inner = e?.body?.error?.innerError ?? e?.response?.data?.error?.innerError;
   if (inner) described.innerError = inner;

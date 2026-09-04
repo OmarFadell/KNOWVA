@@ -82,3 +82,6 @@ deploy:
         TENANT_ID: ${{AAD_APP_TENANT_ID}}
         BOT_TYPE: SingleTenant
         AAD_APP_OAUTH_CONNECTION_NAME: graph
+        # Decrypted from env/.env.local.user and written into .localConfigs,
+        # which is gitignored. config.ts refuses to start without it.
+        ANTHROPIC_API_KEY: ${{SECRET_ANTHROPIC_API_KEY}}

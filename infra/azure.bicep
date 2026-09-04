@@ -25,6 +25,13 @@ param botAadAppTenantId string
 
 param oauthConnectionName string = 'graph'
 
+@secure()
+@description('Anthropic API key (SECRET_ANTHROPIC_API_KEY). Marked @secure() so it is redacted from deployment history and portal output.')
+param anthropicApiKey string
+
+@description('Claude model id. Overridable per environment so changing models needs no code change.')
+param anthropicModel string = 'claude-sonnet-5'
+
 // F1 (Free) does not support Always On -- setting it true makes the deployment fail.
 var alwaysOnSupported = webAppSku != 'F1'
 
@@ -78,6 +85,21 @@ resource webApp 'Microsoft.Web/sites@2021-02-01' = {
         {
           name: 'AAD_APP_OAUTH_CONNECTION_NAME'
           value: oauthConnectionName
+        }
+        // The key lands in plain text in App Service application settings, which
+        // anyone with read access to the site can see. The better long-term
+        // answer is Key Vault: store the secret there and set this value to a
+        // reference -- @Microsoft.KeyVault(SecretUri=...) -- with the web app
+        // given a managed identity and a get-secret role assignment. Deferred
+        // for now because the bot deliberately has no managed identity (an
+        // MI-backed bot cannot carry the SSO OAuth connection).
+        {
+          name: 'ANTHROPIC_API_KEY'
+          value: anthropicApiKey
+        }
+        {
+          name: 'ANTHROPIC_MODEL'
+          value: anthropicModel
         }
       ]
       ftpsState: 'FtpsOnly'

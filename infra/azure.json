@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.46.1.21595",
-      "templateHash": "33456985976942639"
+      "templateHash": "11870403502650958864"
     }
   },
   "parameters": {
@@ -61,6 +61,19 @@
     "oauthConnectionName": {
       "type": "string",
       "defaultValue": "graph"
+    },
+    "anthropicApiKey": {
+      "type": "securestring",
+      "metadata": {
+        "description": "Anthropic API key (SECRET_ANTHROPIC_API_KEY). Marked @secure() so it is redacted from deployment history and portal output."
+      }
+    },
+    "anthropicModel": {
+      "type": "string",
+      "defaultValue": "claude-sonnet-5",
+      "metadata": {
+        "description": "Claude model id. Overridable per environment so changing models needs no code change."
+      }
     }
   },
   "variables": {
@@ -120,6 +133,14 @@
             {
               "name": "AAD_APP_OAUTH_CONNECTION_NAME",
               "value": "[parameters('oauthConnectionName')]"
+            },
+            {
+              "name": "ANTHROPIC_API_KEY",
+              "value": "[parameters('anthropicApiKey')]"
+            },
+            {
+              "name": "ANTHROPIC_MODEL",
+              "value": "[parameters('anthropicModel')]"
             }
           ],
           "ftpsState": "FtpsOnly"

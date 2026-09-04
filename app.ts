@@ -1,4 +1,5 @@
-import { stripMentionsText, TokenCredentials } from "@microsoft/teams.api";
+import { stripMentionsText, TokenCredentials, TypingActivityInput } from "@microsoft/teams.api";
+import type { ActivityLike } from "@microsoft/teams.api";
 import { App } from "@microsoft/teams.apps";
 import { LocalStorage } from "@microsoft/teams.common";
 import type { ILogger } from "@microsoft/teams.common";
@@ -8,6 +9,15 @@ import { ManagedIdentityCredential } from "@azure/identity";
 import { getMe } from "./src/graph/me";
 import { graphClientForToken } from "./src/graph/client";
 import { describeError } from "./src/errors";
+import { createLlmProvider } from "./src/llm";
+import type { LlmMessage } from "./src/llm";
+import { appendToHistory, clearHistory, getHistory } from "./src/llm/history";
+import { buildSystemPrompt } from "./src/llm/prompt";
+
+// Built once at startup. config.ts has already validated the credentials for
+// the selected provider by this point, so a misconfigured deployment fails here
+// rather than on somebody's first message.
+const llm = createLlmProvider();
 
 // Create storage for conversation history
 const storage = new LocalStorage();
@@ -75,25 +85,60 @@ const pendingKey = (conversationId: string, userId: string) =>
   `pending-signin:${conversationId}:${userId}`;
 
 /**
- * Looks the user up in Graph and sends the identity-aware echo.
+ * Identifies the user via Graph, then answers with the LLM.
  * Takes the pieces it needs rather than a whole context, so it can serve both
  * the message turn and the signin event, whose contexts differ.
  */
-async function replyWithIdentity(
+async function respondWithLlm(
   graph: GraphClient,
   log: ILogger,
-  send: (text: string) => Promise<unknown>,
+  send: (activity: ActivityLike) => Promise<unknown>,
   text: string,
-  count: number
+  conversationId: string
 ): Promise<void> {
+  // Teams shows nothing at all while we wait on Graph and the model, and a model
+  // turn runs to several seconds. This has to go out before any slow work.
+  await send(new TypingActivityInput());
+
+  // The SSO payoff: the display name goes into the system prompt so Claude can
+  // address the user directly. Losing the name should degrade the reply, not
+  // cost the user their answer, so this failure is non-fatal.
+  let displayName = "the user";
   try {
     const me = await getMe(graph);
-    await send(`Hi ${me.displayName}! [${count}] you said: ${text}`);
+    displayName = me.displayName;
   } catch (err) {
-    log.error("graph: /me failed after a successful token exchange", describeError(err), err);
+    log.error("graph: /me failed, answering without the user's name", describeError(err), err);
+  }
+
+  const userMessage: LlmMessage = { role: "user", content: text };
+
+  try {
+    const response = await llm.complete({
+      system: buildSystemPrompt(displayName),
+      // History is committed only after a successful reply, so a failed turn
+      // cannot leave an unanswered user message behind to confuse the next one.
+      messages: [...getHistory(conversationId), userMessage],
+    });
+
+    if (response.stopReason === "refusal") {
+      log.warn(`llm: ${llm.name}/${llm.model} declined this request`);
+      await send("I can't help with that one, sorry. Try rephrasing it, or ask me something else.");
+      return;
+    }
+
+    if (response.stopReason === "max_tokens") {
+      log.warn(`llm: ${llm.name}/${llm.model} hit the output cap; reply may be cut short`);
+    }
+
+    const reply = response.text || "I couldn't put a reply together for that. Try asking again.";
+    appendToHistory(conversationId, userMessage, { role: "assistant", content: reply });
+    await send(reply);
+  } catch (err) {
+    log.error(`llm: ${llm.name}/${llm.model} request failed`, describeError(err), err);
     await send(
-      `[${count}] you said: ${text}\n\n` +
-        "(I know who you are but couldn't reach Microsoft Graph to look up your name -- try again shortly.)"
+      "I couldn't reach my language model just then -- that's a problem on my side, not yours. " +
+        "Give it a moment and try again."
     );
   }
 }
@@ -104,7 +149,8 @@ app.on("message", async (context) => {
 
   if (text === "/reset") {
     storage.delete(activity.conversation.id);
-    await context.send("Ok I've deleted the current conversation state.");
+    clearHistory(activity.conversation.id);
+    await context.send("Ok I've cleared this conversation -- I've forgotten what we discussed.");
     return;
   }
 
@@ -134,19 +180,19 @@ app.on("message", async (context) => {
     return;
   }
 
-  // Default echo behavior, identity-aware via silent Teams SSO.
+  // Default behaviour: answer with the LLM, identified via silent Teams SSO.
   const state = getConversationState(activity.conversation.id);
   state.count++;
 
   // Fast path: the eager token fetch at the start of the turn found a cached
   // token, so the exchange already happened on some earlier turn.
   if (context.isSignedIn && context.userToken) {
-    await replyWithIdentity(
+    await respondWithLlm(
       context.userGraph,
       context.log,
-      (t) => context.send(t),
+      (a) => context.send(a),
       text,
-      state.count
+      activity.conversation.id
     );
     return;
   }
@@ -168,12 +214,12 @@ app.on("message", async (context) => {
       // over this turn's (empty) eager fetch, so it can't see this token -- build
       // a client around the token we were just handed.
       storage.delete(key);
-      await replyWithIdentity(
+      await respondWithLlm(
         graphClientForToken(token),
         context.log,
-        (t) => context.send(t),
+        (a) => context.send(a),
         text,
-        state.count
+        activity.conversation.id
       );
       return;
     }
@@ -222,12 +268,12 @@ app.event("signin", async (context) => {
     return;
   }
 
-  await replyWithIdentity(
+  await respondWithLlm(
     context.userGraph,
     context.log,
-    (t) => context.send(t),
+    (a) => context.send(a),
     pending.text,
-    pending.count
+    activity.conversation.id
   );
 });
 

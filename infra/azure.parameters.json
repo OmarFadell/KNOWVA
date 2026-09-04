@@ -22,6 +22,12 @@
     },
     "oauthConnectionName": {
       "value": "graph"
+    },
+    "anthropicApiKey": {
+      "value": "${{SECRET_ANTHROPIC_API_KEY}}"
+    },
+    "anthropicModel": {
+      "value": "claude-sonnet-5"
     }
   }
 }
