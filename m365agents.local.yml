@@ -1,0 +1,77 @@
+# yaml-language-server: $schema=https://aka.ms/m365-agents-toolkits/v1.11/yaml.schema.json
+version: v1.11
+
+environmentFolderPath: ./env
+
+provision:
+  - uses: teamsApp/create
+    with:
+      name: KNOWVA${{APP_NAME_SUFFIX}}
+    writeToEnvironmentFile:
+      teamsAppId: TEAMS_APP_ID
+
+  # Create or reuse the Entra application backing the bot.
+  # Single-tenant for now. To go multi-tenant later see SETUP.md.
+  - uses: aadApp/create
+    with:
+      name: KNOWVA${{APP_NAME_SUFFIX}}
+      generateClientSecret: true
+      generateServicePrincipal: true
+      signInAudience: AzureADMyOrg
+    writeToEnvironmentFile:
+      clientId: BOT_ID
+      clientSecret: SECRET_BOT_PASSWORD
+      objectId: BOT_OBJECT_ID
+      tenantId: AAD_APP_TENANT_ID
+
+  # Replaces the template's botFramework/create.
+  # A dev.botframework.com registration cannot carry an OAuth connection
+  # setting, so local uses a real Azure Bot resource -- same as dev.
+  # This redeploys every provision, so the messaging endpoint always tracks
+  # the current dev tunnel host.
+  - uses: arm/deploy
+    with:
+      subscriptionId: ${{AZURE_SUBSCRIPTION_ID}}
+      resourceGroupName: ${{AZURE_RESOURCE_GROUP_NAME}}
+      templates:
+        - path: ./infra/local.bicep
+          parameters: ./infra/local.parameters.json
+          deploymentName: Create-local-bot
+
+  - uses: teamsApp/zipAppPackage
+    with:
+      manifestPath: ./appPackage/manifest.json
+      outputZipPath: ./appPackage/build/appPackage.${{TEAMSFX_ENV}}.zip
+      outputFolder: ./appPackage/build
+
+  - uses: teamsApp/validateAppPackage
+    with:
+      appPackagePath: ./appPackage/build/appPackage.${{TEAMSFX_ENV}}.zip
+
+  - uses: teamsApp/update
+    with:
+      appPackagePath: ./appPackage/build/appPackage.${{TEAMSFX_ENV}}.zip
+
+  # Fail loudly if the artifacts we think exist do not.
+  # This is the gate that would have caught the last build's silent half-provision.
+  - uses: script
+    name: verify provision
+    with:
+      run: pwsh -File ./scripts/verify-provision.ps1 -BotId "${{BOT_ID}}" -ResourceGroup "${{AZURE_RESOURCE_GROUP_NAME}}" -ConnectionName "graph"
+
+deploy:
+  - uses: cli/runNpmCommand
+    name: install dependencies
+    with:
+      args: install
+
+  - uses: file/createOrUpdateEnvironmentFile
+    with:
+      target: ./.localConfigs
+      envs:
+        PORT: 3978
+        CLIENT_ID: ${{BOT_ID}}
+        CLIENT_SECRET: ${{SECRET_BOT_PASSWORD}}
+        TENANT_ID: ${{AAD_APP_TENANT_ID}}
+        BOT_TYPE: SingleTenant
+        AAD_APP_OAUTH_CONNECTION_NAME: graph

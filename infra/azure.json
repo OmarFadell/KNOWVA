@@ -1,0 +1,334 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "_generator": {
+      "name": "bicep",
+      "version": "0.46.1.21595",
+      "templateHash": "33456985976942639"
+    }
+  },
+  "parameters": {
+    "resourceBaseName": {
+      "type": "string",
+      "minLength": 4,
+      "maxLength": 20,
+      "metadata": {
+        "description": "Used to generate names for all resources in this file"
+      }
+    },
+    "webAppSku": {
+      "type": "string",
+      "defaultValue": "F1",
+      "metadata": {
+        "description": "App Service plan SKU. F1 is free; switch to B1 for Always On."
+      }
+    },
+    "serverfarmsName": {
+      "type": "string",
+      "defaultValue": "[parameters('resourceBaseName')]"
+    },
+    "webAppName": {
+      "type": "string",
+      "defaultValue": "[parameters('resourceBaseName')]"
+    },
+    "location": {
+      "type": "string",
+      "defaultValue": "[resourceGroup().location]"
+    },
+    "botDisplayName": {
+      "type": "string",
+      "maxLength": 42
+    },
+    "botAadAppClientId": {
+      "type": "string",
+      "metadata": {
+        "description": "Client ID of the Entra app created by aadApp/create (BOT_ID)."
+      }
+    },
+    "botAadAppClientSecret": {
+      "type": "securestring",
+      "metadata": {
+        "description": "Client secret of that Entra app (SECRET_BOT_PASSWORD)."
+      }
+    },
+    "botAadAppTenantId": {
+      "type": "string",
+      "metadata": {
+        "description": "Tenant ID. Switch to \"common\" when going multi-tenant."
+      }
+    },
+    "oauthConnectionName": {
+      "type": "string",
+      "defaultValue": "graph"
+    }
+  },
+  "variables": {
+    "alwaysOnSupported": "[not(equals(parameters('webAppSku'), 'F1'))]"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Web/serverfarms",
+      "apiVersion": "2021-02-01",
+      "name": "[parameters('serverfarmsName')]",
+      "kind": "app",
+      "location": "[parameters('location')]",
+      "sku": {
+        "name": "[parameters('webAppSku')]"
+      }
+    },
+    {
+      "type": "Microsoft.Web/sites",
+      "apiVersion": "2021-02-01",
+      "name": "[parameters('webAppName')]",
+      "kind": "app",
+      "location": "[parameters('location')]",
+      "properties": {
+        "serverFarmId": "[resourceId('Microsoft.Web/serverfarms', parameters('serverfarmsName'))]",
+        "httpsOnly": true,
+        "siteConfig": {
+          "alwaysOn": "[variables('alwaysOnSupported')]",
+          "appSettings": [
+            {
+              "name": "WEBSITE_RUN_FROM_PACKAGE",
+              "value": "1"
+            },
+            {
+              "name": "WEBSITE_NODE_DEFAULT_VERSION",
+              "value": "~22"
+            },
+            {
+              "name": "RUNNING_ON_AZURE",
+              "value": "1"
+            },
+            {
+              "name": "BOT_TYPE",
+              "value": "SingleTenant"
+            },
+            {
+              "name": "CLIENT_ID",
+              "value": "[parameters('botAadAppClientId')]"
+            },
+            {
+              "name": "CLIENT_SECRET",
+              "value": "[parameters('botAadAppClientSecret')]"
+            },
+            {
+              "name": "TENANT_ID",
+              "value": "[parameters('botAadAppTenantId')]"
+            },
+            {
+              "name": "AAD_APP_OAUTH_CONNECTION_NAME",
+              "value": "[parameters('oauthConnectionName')]"
+            }
+          ],
+          "ftpsState": "FtpsOnly"
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Web/serverfarms', parameters('serverfarmsName'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "Azure-Bot-registration",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "resourceBaseName": {
+            "value": "[parameters('resourceBaseName')]"
+          },
+          "botDisplayName": {
+            "value": "[parameters('botDisplayName')]"
+          },
+          "botAadAppClientId": {
+            "value": "[parameters('botAadAppClientId')]"
+          },
+          "botAadAppClientSecret": {
+            "value": "[parameters('botAadAppClientSecret')]"
+          },
+          "botAadAppTenantId": {
+            "value": "[parameters('botAadAppTenantId')]"
+          },
+          "botAppDomain": {
+            "value": "[reference(resourceId('Microsoft.Web/sites', parameters('webAppName')), '2021-02-01').defaultHostName]"
+          },
+          "oauthConnectionName": {
+            "value": "[parameters('oauthConnectionName')]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.46.1.21595",
+              "templateHash": "11570087872456400100"
+            }
+          },
+          "parameters": {
+            "resourceBaseName": {
+              "type": "string",
+              "minLength": 4,
+              "maxLength": 20,
+              "metadata": {
+                "description": "Used to generate names for all resources in this file"
+              }
+            },
+            "botDisplayName": {
+              "type": "string",
+              "maxLength": 42
+            },
+            "botServiceName": {
+              "type": "string",
+              "defaultValue": "[parameters('resourceBaseName')]"
+            },
+            "botServiceSku": {
+              "type": "string",
+              "defaultValue": "F0"
+            },
+            "botAadAppClientId": {
+              "type": "string",
+              "metadata": {
+                "description": "Client ID of the Entra app registration backing the bot (BOT_ID)."
+              }
+            },
+            "botAadAppClientSecret": {
+              "type": "securestring",
+              "metadata": {
+                "description": "Client secret of that Entra app (SECRET_BOT_PASSWORD). Needed by the OAuth connection."
+              }
+            },
+            "botAadAppTenantId": {
+              "type": "string",
+              "metadata": {
+                "description": "Tenant ID the bot is scoped to. Switch to \"common\" when going multi-tenant."
+              }
+            },
+            "botAppDomain": {
+              "type": "string",
+              "metadata": {
+                "description": "Hostname only, no scheme. e.g. knowva.azurewebsites.net or abc-3978.uks1.devtunnels.ms"
+              }
+            },
+            "oauthConnectionName": {
+              "type": "string",
+              "defaultValue": "graph",
+              "metadata": {
+                "description": "Name of the OAuth connection used for Teams SSO. Must match AAD_APP_OAUTH_CONNECTION_NAME in code."
+              }
+            },
+            "oauthScopes": {
+              "type": "string",
+              "defaultValue": "User.Read",
+              "metadata": {
+                "description": "Graph scopes granted through the OAuth connection. Milestone 1 only needs User.Read."
+              }
+            }
+          },
+          "resources": [
+            {
+              "type": "Microsoft.BotService/botServices",
+              "apiVersion": "2022-09-15",
+              "name": "[parameters('botServiceName')]",
+              "kind": "azurebot",
+              "location": "global",
+              "sku": {
+                "name": "[parameters('botServiceSku')]"
+              },
+              "properties": {
+                "displayName": "[parameters('botDisplayName')]",
+                "endpoint": "[format('https://{0}/api/messages', parameters('botAppDomain'))]",
+                "msaAppId": "[parameters('botAadAppClientId')]",
+                "msaAppTenantId": "[parameters('botAadAppTenantId')]",
+                "msaAppType": "SingleTenant"
+              }
+            },
+            {
+              "type": "Microsoft.BotService/botServices/channels",
+              "apiVersion": "2022-09-15",
+              "name": "[format('{0}/{1}', parameters('botServiceName'), 'MsTeamsChannel')]",
+              "location": "global",
+              "properties": {
+                "channelName": "MsTeamsChannel"
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.BotService/botServices', parameters('botServiceName'))]"
+              ]
+            },
+            {
+              "type": "Microsoft.BotService/botServices/connections",
+              "apiVersion": "2022-09-15",
+              "name": "[format('{0}/{1}', parameters('botServiceName'), parameters('oauthConnectionName'))]",
+              "location": "global",
+              "properties": {
+                "serviceProviderId": "30dd229c-58e3-4a48-bdfd-91ec48eb906c",
+                "serviceProviderDisplayName": "Azure Active Directory v2",
+                "clientId": "[parameters('botAadAppClientId')]",
+                "clientSecret": "[parameters('botAadAppClientSecret')]",
+                "scopes": "[parameters('oauthScopes')]",
+                "parameters": [
+                  {
+                    "key": "tenantID",
+                    "value": "[parameters('botAadAppTenantId')]"
+                  },
+                  {
+                    "key": "tokenExchangeUrl",
+                    "value": "[format('api://botid-{0}', parameters('botAadAppClientId'))]"
+                  }
+                ]
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.BotService/botServices', parameters('botServiceName'))]"
+              ]
+            }
+          ],
+          "outputs": {
+            "BOT_DOMAIN": {
+              "type": "string",
+              "value": "[parameters('botAppDomain')]"
+            },
+            "BOT_SERVICE_NAME": {
+              "type": "string",
+              "value": "[parameters('botServiceName')]"
+            },
+            "OAUTH_CONNECTION_NAME": {
+              "type": "string",
+              "value": "[parameters('oauthConnectionName')]"
+            }
+          }
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Web/sites', parameters('webAppName'))]"
+      ]
+    }
+  ],
+  "outputs": {
+    "AZURE_APP_SERVICE_RESOURCE_ID": {
+      "type": "string",
+      "value": "[resourceId('Microsoft.Web/sites', parameters('webAppName'))]"
+    },
+    "BOT_DOMAIN": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.Web/sites', parameters('webAppName')), '2021-02-01').defaultHostName]"
+    },
+    "BOT_ENDPOINT": {
+      "type": "string",
+      "value": "[format('https://{0}', reference(resourceId('Microsoft.Web/sites', parameters('webAppName')), '2021-02-01').defaultHostName)]"
+    },
+    "BOT_SERVICE_NAME": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.Resources/deployments', 'Azure-Bot-registration'), '2025-04-01').outputs.BOT_SERVICE_NAME.value]"
+    },
+    "AAD_APP_OAUTH_CONNECTION_NAME": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.Resources/deployments', 'Azure-Bot-registration'), '2025-04-01').outputs.OAUTH_CONNECTION_NAME.value]"
+    }
+  }
+}
