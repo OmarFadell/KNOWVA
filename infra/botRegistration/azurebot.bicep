@@ -25,8 +25,8 @@ param botAppDomain string
 @description('Name of the OAuth connection used for Teams SSO. Must match AAD_APP_OAUTH_CONNECTION_NAME in code.')
 param oauthConnectionName string = 'graph'
 
-@description('Graph scopes granted through the OAuth connection. Milestone 1 only needs User.Read.')
-param oauthScopes string = 'User.Read'
+@description('Graph delegated scopes granted through the OAuth connection. User.Read for SSO identity; Files.Read.All + Sites.Read.All are both required by the Microsoft 365 Copilot Retrieval API (SharePoint document search).')
+param oauthScopes string = 'User.Read Files.Read.All Sites.Read.All'
 
 // SingleTenant (not UserAssignedMSI) -- an MI-backed bot cannot carry an OAuth
 // connection setting, which Teams SSO token exchange requires.

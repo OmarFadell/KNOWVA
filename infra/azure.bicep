@@ -32,6 +32,10 @@ param anthropicApiKey string
 @description('Claude model id. Overridable per environment so changing models needs no code change.')
 param anthropicModel string = 'claude-sonnet-5'
 
+@minLength(1)
+@description('Full URL of the SharePoint site the search_documents tool queries (SHAREPOINT_SITE_URL). Not a secret. Deployment fails if empty, because the app cannot start without it.')
+param sharePointSiteUrl string
+
 // F1 (Free) does not support Always On -- setting it true makes the deployment fail.
 var alwaysOnSupported = webAppSku != 'F1'
 
@@ -100,6 +104,10 @@ resource webApp 'Microsoft.Web/sites@2021-02-01' = {
         {
           name: 'ANTHROPIC_MODEL'
           value: anthropicModel
+        }
+        {
+          name: 'SHAREPOINT_SITE_URL'
+          value: sharePointSiteUrl
         }
       ]
       ftpsState: 'FtpsOnly'

@@ -28,6 +28,9 @@
     },
     "anthropicModel": {
       "value": "claude-sonnet-5"
+    },
+    "sharePointSiteUrl": {
+      "value": "${{SHAREPOINT_SITE_URL}}"
     }
   }
 }

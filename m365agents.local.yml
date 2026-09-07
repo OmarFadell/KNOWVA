@@ -85,3 +85,6 @@ deploy:
         # Decrypted from env/.env.local.user and written into .localConfigs,
         # which is gitignored. config.ts refuses to start without it.
         ANTHROPIC_API_KEY: ${{SECRET_ANTHROPIC_API_KEY}}
+        # SharePoint site the search_documents tool is scoped to. Not a secret;
+        # set in env/.env.local. config.ts refuses to start without it.
+        SHAREPOINT_SITE_URL: ${{SHAREPOINT_SITE_URL}}

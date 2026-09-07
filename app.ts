@@ -13,6 +13,10 @@ import { createLlmProvider } from "./src/llm";
 import type { LlmMessage } from "./src/llm";
 import { appendToHistory, clearHistory, getHistory } from "./src/llm/history";
 import { buildSystemPrompt } from "./src/llm/prompt";
+import { runAgent } from "./src/agent";
+import { createSharePointSearchTool } from "./src/tools/sharepoint-search";
+import { createDocumentMetadataTool } from "./src/tools/document-metadata";
+import { withSendRetry } from "./src/send-retry";
 
 // Built once at startup. config.ts has already validated the credentials for
 // the selected provider by this point, so a misconfigured deployment fails here
@@ -98,7 +102,13 @@ async function respondWithLlm(
 ): Promise<void> {
   // Teams shows nothing at all while we wait on Graph and the model, and a model
   // turn runs to several seconds. This has to go out before any slow work.
-  await send(new TypingActivityInput());
+  // Best-effort: a typing indicator that fails to send must never cost the user
+  // their answer, which is what an unhandled throw here would do.
+  try {
+    await send(new TypingActivityInput());
+  } catch (err) {
+    log.warn("send: typing indicator failed, continuing", describeError(err));
+  }
 
   // The SSO payoff: the display name goes into the system prompt so Claude can
   // address the user directly. Losing the name should degrade the reply, not
@@ -113,25 +123,41 @@ async function respondWithLlm(
 
   const userMessage: LlmMessage = { role: "user", content: text };
 
+  // Both tools are delegated and security-trim to what this user can see, so
+  // they are built around *this turn's* Graph client (the user's token), not a
+  // shared one. Claude chains them: search_documents finds a document and
+  // returns its webUrl, get_document_metadata resolves that URL when the
+  // question is about currency or authorship.
+  const tools = [
+    createSharePointSearchTool(graph, config.sharePointSiteUrl, log),
+    createDocumentMetadataTool(graph, log),
+  ];
+
   try {
-    const response = await llm.complete({
+    const result = await runAgent({
+      provider: llm,
       system: buildSystemPrompt(displayName),
       // History is committed only after a successful reply, so a failed turn
       // cannot leave an unanswered user message behind to confuse the next one.
+      // The loop's intermediate tool turns stay local to runAgent and are never
+      // persisted.
       messages: [...getHistory(conversationId), userMessage],
+      tools,
+      logger: log,
+      maxIterations: 5,
     });
 
-    if (response.stopReason === "refusal") {
+    if (result.stopReason === "refusal") {
       log.warn(`llm: ${llm.name}/${llm.model} declined this request`);
       await send("I can't help with that one, sorry. Try rephrasing it, or ask me something else.");
       return;
     }
 
-    if (response.stopReason === "max_tokens") {
+    if (result.stopReason === "max_tokens") {
       log.warn(`llm: ${llm.name}/${llm.model} hit the output cap; reply may be cut short`);
     }
 
-    const reply = response.text || "I couldn't put a reply together for that. Try asking again.";
+    const reply = result.text || "I couldn't put a reply together for that. Try asking again.";
     appendToHistory(conversationId, userMessage, { role: "assistant", content: reply });
     await send(reply);
   } catch (err) {
@@ -190,7 +216,7 @@ app.on("message", async (context) => {
     await respondWithLlm(
       context.userGraph,
       context.log,
-      (a) => context.send(a),
+      withSendRetry((a) => context.send(a), context.log),
       text,
       activity.conversation.id
     );
@@ -217,7 +243,7 @@ app.on("message", async (context) => {
       await respondWithLlm(
         graphClientForToken(token),
         context.log,
-        (a) => context.send(a),
+        withSendRetry((a) => context.send(a), context.log),
         text,
         activity.conversation.id
       );
@@ -271,7 +297,7 @@ app.event("signin", async (context) => {
   await respondWithLlm(
     context.userGraph,
     context.log,
-    (a) => context.send(a),
+    withSendRetry((a) => context.send(a), context.log),
     pending.text,
     activity.conversation.id
   );
