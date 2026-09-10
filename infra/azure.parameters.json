@@ -31,6 +31,9 @@
     },
     "sharePointSiteUrl": {
       "value": "${{SHAREPOINT_SITE_URL}}"
+    },
+    "teamsAppId": {
+      "value": "${{TEAMS_APP_ID}}"
     }
   }
 }

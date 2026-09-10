@@ -32,6 +32,9 @@ param anthropicApiKey string
 @description('Claude model id. Overridable per environment so changing models needs no code change.')
 param anthropicModel string = 'claude-sonnet-5'
 
+@description('Teams app (catalog) id, from teamsApp/create. search_conversations needs it to work out which chats Knowva is installed in.')
+param teamsAppId string
+
 @minLength(1)
 @description('Full URL of the SharePoint site the search_documents tool queries (SHAREPOINT_SITE_URL). Not a secret. Deployment fails if empty, because the app cannot start without it.')
 param sharePointSiteUrl string
@@ -108,6 +111,10 @@ resource webApp 'Microsoft.Web/sites@2021-02-01' = {
         {
           name: 'SHAREPOINT_SITE_URL'
           value: sharePointSiteUrl
+        }
+        {
+          name: 'TEAMS_APP_ID'
+          value: teamsAppId
         }
       ]
       ftpsState: 'FtpsOnly'

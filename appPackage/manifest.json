@@ -36,18 +36,32 @@
             "supportsTargetedMessages": false,
             "commandLists": [
                 {
-                  "scopes": ["personal", "team", "groupChat"],
-                  "triggers": ["mention"],
-                  "commands": [
-                      {
-                          "title": "Hi",
-                          "description": "Say hi to the bot."
-                      },
-                      {
-                          "title": "/reset",
-                          "description": "Delete conversation state."
-                      }
-                  ]
+                    "scopes": [
+                        "personal",
+                        "team",
+                        "groupChat"
+                    ],
+                    "triggers": [
+                        "mention"
+                    ],
+                    "commands": [
+                        {
+                            "title": "Hi",
+                            "description": "Say hi to the bot."
+                        },
+                        {
+                            "title": "/reset",
+                            "description": "Delete conversation state."
+                        },
+                        {
+                            "title": "/pause",
+                            "description": "Stop reading this conversation until resumed."
+                        },
+                        {
+                            "title": "/resume",
+                            "description": "Start reading this conversation again."
+                        }
+                    ]
                 }
             ]
         }
@@ -65,5 +79,15 @@
     "webApplicationInfo": {
         "id": "${{BOT_ID}}",
         "resource": "api://botid-${{BOT_ID}}"
+    },
+    "authorization": {
+        "permissions": {
+            "resourceSpecific": [
+                {
+                    "name": "ChatMessage.Read.Chat",
+                    "type": "Application"
+                }
+            ]
+        }
     }
 }

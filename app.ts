@@ -16,6 +16,20 @@ import { buildSystemPrompt } from "./src/llm/prompt";
 import { runAgent } from "./src/agent";
 import { createSharePointSearchTool } from "./src/tools/sharepoint-search";
 import { createDocumentMetadataTool } from "./src/tools/document-metadata";
+import { createConversationSearchTool } from "./src/tools/conversation-search";
+import {
+  groupChatWelcomeMessage,
+  isGroupConversation,
+  pauseConversation,
+  resumeConversation,
+  shouldIngest,
+  shouldRespond,
+} from "./src/teams/group-chat";
+import {
+  clearAmbientMessages,
+  formatAmbientContext,
+  recordAmbientMessage,
+} from "./src/teams/chat-context";
 import { withSendRetry } from "./src/send-retry";
 
 // Built once at startup. config.ts has already validated the credentials for
@@ -81,6 +95,14 @@ const getConversationState = (conversationId: string): ConversationState => {
 interface PendingSignin {
   text: string;
   count: number;
+  /**
+   * The ambient group-chat context as it stood when the question was asked.
+   * Captured rather than recomputed, so the answer is grounded in what the chat
+   * looked like at the time -- a busy group chat can move on considerably in the
+   * seconds a token exchange takes.
+   */
+  conversationContext?: string | null;
+  tenantId?: string;
 }
 
 // Keyed per user, not per conversation: in a group chat several people can each
@@ -98,7 +120,13 @@ async function respondWithLlm(
   log: ILogger,
   send: (activity: ActivityLike) => Promise<unknown>,
   text: string,
-  conversationId: string
+  conversationId: string,
+  options: {
+    /** Attributed recent messages from this group chat, or null in a 1:1. */
+    conversationContext?: string | null;
+    /** Used to build message deep links that resolve for multi-tenant users. */
+    tenantId?: string;
+  } = {}
 ): Promise<void> {
   // Teams shows nothing at all while we wait on Graph and the model, and a model
   // turn runs to several seconds. This has to go out before any slow work.
@@ -128,15 +156,23 @@ async function respondWithLlm(
   // shared one. Claude chains them: search_documents finds a document and
   // returns its webUrl, get_document_metadata resolves that URL when the
   // question is about currency or authorship.
+  //
+  // search_conversations is the odd one out: it takes the user's client to work
+  // out *which* chats to look in, but reads the messages with the bot's own
+  // app-only token, because RSC grants are application permissions. See
+  // src/tools/conversation-search.ts for why it needs both.
   const tools = [
     createSharePointSearchTool(graph, config.sharePointSiteUrl, log),
     createDocumentMetadataTool(graph, log),
+    createConversationSearchTool(graph, options.tenantId, log),
   ];
 
   try {
     const result = await runAgent({
       provider: llm,
-      system: buildSystemPrompt(displayName),
+      system: buildSystemPrompt(displayName, {
+        conversationContext: options.conversationContext,
+      }),
       // History is committed only after a successful reply, so a failed turn
       // cannot leave an unanswered user message behind to confuse the next one.
       // The loop's intermediate tool turns stay local to runAgent and are never
@@ -172,10 +208,63 @@ async function respondWithLlm(
 app.on("message", async (context) => {
   const activity = context.activity;
   const text: string = stripMentionsText(activity);
+  const conversationId = activity.conversation.id;
+  const inGroup = isGroupConversation(activity);
+
+  // READING AND ANSWERING ARE TWO DIFFERENT DECISIONS.
+  //
+  // In a group chat Knowva receives every message, mentioned or not -- that is
+  // what the groupChat scope buys, and it is what makes a later "so what did we
+  // land on?" answerable. It is NOT permission to talk. So this handler ingests
+  // first, unconditionally, and only then asks whether it was addressed.
+  //
+  // Note the ordering: context is captured BEFORE this message is recorded, so
+  // the model does not get the question it is answering handed back to it twice.
+  const conversationContext = inGroup ? formatAmbientContext(conversationId) : null;
+
+  if (shouldIngest(activity, text)) {
+    recordAmbientMessage(conversationId, {
+      authorName: activity.from.name?.trim() || "an unidentified participant",
+      // tagOnly keeps the *inner* text of every mention, so "@Priya can you
+      // check this" is remembered as "Priya can you check this" rather than
+      // losing the name entirely. Who was being addressed is often the whole
+      // point of a message. The bot's own question text above still uses the
+      // full strip, because Knowva does not need its own name echoed back.
+      text: stripMentionsText(activity, { tagOnly: true }),
+      timestamp: (activity.timestamp ? new Date(activity.timestamp) : new Date()).toISOString(),
+    });
+  }
+
+  // The soft off switch. Deliberately handled before the shouldRespond gate:
+  // /resume has to work while paused, or the pause would be permanent.
+  if (text === "/pause") {
+    pauseConversation(conversationId);
+    await context.send(
+      "Ok -- I've stopped reading this conversation. Say **/resume** to turn me back on. " +
+        "If you want me gone for good, remove me from the chat: that revokes my access rather " +
+        "than just asking me not to look."
+    );
+    return;
+  }
+
+  if (text === "/resume") {
+    resumeConversation(conversationId);
+    await context.send("Ok -- I'm reading this conversation again.");
+    return;
+  }
+
+  // Everything past here is a reply. In a group chat that means Knowva was
+  // @mentioned; other people's messages stop here, having been remembered.
+  if (!shouldRespond(activity)) {
+    return;
+  }
 
   if (text === "/reset") {
-    storage.delete(activity.conversation.id);
-    clearHistory(activity.conversation.id);
+    storage.delete(conversationId);
+    clearHistory(conversationId);
+    // Also drop the ambient buffer: "forget what we discussed" plainly covers
+    // the surrounding chat Knowva was holding, not just its own dialogue.
+    clearAmbientMessages(conversationId);
     await context.send("Ok I've cleared this conversation -- I've forgotten what we discussed.");
     return;
   }
@@ -207,8 +296,12 @@ app.on("message", async (context) => {
   }
 
   // Default behaviour: answer with the LLM, identified via silent Teams SSO.
-  const state = getConversationState(activity.conversation.id);
+  const state = getConversationState(conversationId);
   state.count++;
+
+  // Needed to build message deep links that land in the right tenant for a
+  // guest or multi-tenant user. Falls back to the bot's own configured tenant.
+  const tenantId = activity.conversation.tenantId || config.MicrosoftAppTenantId;
 
   // Fast path: the eager token fetch at the start of the turn found a cached
   // token, so the exchange already happened on some earlier turn.
@@ -218,7 +311,8 @@ app.on("message", async (context) => {
       context.log,
       withSendRetry((a) => context.send(a), context.log),
       text,
-      activity.conversation.id
+      conversationId,
+      { conversationContext, tenantId }
     );
     return;
   }
@@ -229,8 +323,13 @@ app.on("message", async (context) => {
   // posts back a signin/tokenExchange invoke. The SDK answers that invoke itself and
   // emits the "signin" event handled below. Without this call nothing ever asks
   // Teams for a token, so the token store stays empty and every turn falls back.
-  const key = pendingKey(activity.conversation.id, activity.from.id);
-  storage.set(key, { text, count: state.count } as PendingSignin);
+  const key = pendingKey(conversationId, activity.from.id);
+  storage.set(key, {
+    text,
+    count: state.count,
+    conversationContext,
+    tenantId,
+  } as PendingSignin);
 
   try {
     const token = await context.signin();
@@ -245,7 +344,8 @@ app.on("message", async (context) => {
         context.log,
         withSendRetry((a) => context.send(a), context.log),
         text,
-        activity.conversation.id
+        conversationId,
+        { conversationContext, tenantId }
       );
       return;
     }
@@ -268,6 +368,45 @@ app.on("message", async (context) => {
     await context.send(
       `[${state.count}] you said: ${text}\n\n` +
         "(I couldn't start sign-in just now. That's a problem on my side, not yours -- it's been logged.)"
+    );
+  }
+});
+
+// Fires when Knowva is added to a conversation. In a group chat this is the
+// consent moment: the install itself granted the ChatMessage.Read.Chat RSC
+// permission declared in appPackage/manifest.json, Teams has already posted its
+// own "<person> added Knowva" system message naming who did it, and Knowva is
+// now in the member roster where everyone can see it.
+//
+// Nobody clicks anything else, which is exactly why this message exists. It is
+// a disclosure, not a request: by the time it sends, access has already been
+// granted, so its only job is to make sure nobody in the chat is surprised
+// later about what Knowva can see -- and to name uninstalling as the way out.
+app.on("install.add", async (context) => {
+  const activity = context.activity;
+
+  // Personal installs are the existing 1:1 experience and already covered by
+  // the app's own description; only the group case is a disclosure to a room of
+  // people who did not individually opt in.
+  if (!isGroupConversation(activity)) return;
+
+  context.log.info(
+    `install: added to a group conversation ` +
+      `(conversation=${activity.conversation.id} by=${activity.from.id})`
+  );
+
+  try {
+    await withSendRetry((a: ActivityLike) => context.send(a), context.log)(
+      groupChatWelcomeMessage()
+    );
+  } catch (err) {
+    // Worth an error, not a crash. The install succeeded and RSC is granted
+    // either way -- but the chat now has a bot reading it that never announced
+    // itself, which is precisely the situation the message exists to prevent.
+    context.log.error(
+      `install: failed to post the group-chat disclosure to ${activity.conversation.id}`,
+      describeError(err),
+      err
     );
   }
 });
@@ -299,7 +438,8 @@ app.event("signin", async (context) => {
     context.log,
     withSendRetry((a) => context.send(a), context.log),
     pending.text,
-    activity.conversation.id
+    activity.conversation.id,
+    { conversationContext: pending.conversationContext, tenantId: pending.tenantId }
   );
 });
 

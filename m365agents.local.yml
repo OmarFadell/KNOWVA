@@ -88,3 +88,6 @@ deploy:
         # SharePoint site the search_documents tool is scoped to. Not a secret;
         # set in env/.env.local. config.ts refuses to start without it.
         SHAREPOINT_SITE_URL: ${{SHAREPOINT_SITE_URL}}
+        # Used by search_conversations to filter /me/chats down to the chats
+        # Knowva is installed in. Written by teamsApp/create above.
+        TEAMS_APP_ID: ${{TEAMS_APP_ID}}
