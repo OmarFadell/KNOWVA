@@ -88,6 +88,27 @@ deploy:
         # SharePoint site the search_documents tool is scoped to. Not a secret;
         # set in env/.env.local. config.ts refuses to start without it.
         SHAREPOINT_SITE_URL: ${{SHAREPOINT_SITE_URL}}
+        # Optional. "Display Name=address@domain" pairs separated by ";".
+        # Empty means search_emails can only reach the asking user's own mailbox,
+        # which is the intended default.
+        SHARED_MAILBOXES: ""
         # Used by search_conversations to filter /me/chats down to the chats
         # Knowva is installed in. Written by teamsApp/create above.
         TEAMS_APP_ID: ${{TEAMS_APP_ID}}
+        # GitHub App credentials for search_github. Decrypted from
+        # env/.env.local.user. Empty is fine -- the tool then reports itself
+        # unavailable instead of the app refusing to start.
+        GITHUB_CLIENT_ID: ${{SECRET_GITHUB_CLIENT_ID}}
+        GITHUB_CLIENT_SECRET: ${{SECRET_GITHUB_CLIENT_SECRET}}
+        # Extra root CA for Node's TLS trust store. The path is machine-specific,
+        # so it is set in env/.env.local (gitignored) and this line only carries
+        # it through to .localConfigs, where env-cmd puts it into the process
+        # environment before Node starts. Empty on machines that do not need it,
+        # which Node ignores. See env/.env.local for why it exists.
+        NODE_EXTRA_CA_CERTS: ${{NODE_EXTRA_CA_CERTS}}
+        # The dev-tunnel URL, written by the "Start local tunnel" debug task.
+        # config.ts derives the GitHub OAuth callback URL from this, so it has to
+        # reach the running process -- and because the tunnel hostname changes
+        # each time the tunnel is recreated, the new callback URL has to be added
+        # to the GitHub App before sign-in will work again.
+        BOT_ENDPOINT: ${{BOT_ENDPOINT}}

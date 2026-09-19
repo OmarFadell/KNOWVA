@@ -15,11 +15,50 @@ import type {
  * interface, so it works the same whichever provider LLM_PROVIDER selects.
  */
 
+/**
+ * A side-channel from a tool to the *response layer*, for the rare case where
+ * text back to the model is not enough on its own.
+ *
+ * ---------------------------------------------------------------------------
+ * WHY THIS EXISTS, SINCE IT IS THE FIRST OF ITS KIND.
+ *
+ * Every tool so far communicates in exactly one direction: it returns prose,
+ * the model reads it, the model writes a reply. "No results found" and "access
+ * denied" are handled that way and it works, because in both cases the right
+ * outcome IS just words -- the model has everything it needs to say something
+ * true.
+ *
+ * GitHub sign-in breaks that, and it breaks it for a reason worth stating: the
+ * right outcome is not words, it is a button. Knowva has to send an Adaptive
+ * Card carrying a one-time authorize URL, and a language model cannot be handed
+ * a credential-bearing URL and trusted to reproduce it character-perfect in
+ * prose -- nor should it be, since that URL is single-use and tied to one user.
+ *
+ * So the tool returns BOTH: prose telling the model to explain that a
+ * connection is needed, and this signal telling the response layer to attach
+ * the card. The model never sees the URL.
+ *
+ * Keep this narrow. It is not a general escape hatch for tools that want to
+ * drive the UI; a tool that can express itself in text should.
+ * ---------------------------------------------------------------------------
+ */
+export type AgentToolSignal = {
+  /** The user must authorize an external service before this tool can work. */
+  kind: "needs-auth";
+  /** Which service, so the response layer knows which sign-in to offer. */
+  provider: "github";
+};
+
 export interface AgentToolResult {
   /** Rendered as text back to the model. */
   content: string;
   /** The call failed; `content` is a message explaining why, for the model to relay. */
   isError?: boolean;
+  /**
+   * Out-of-band instruction for the response layer. Never shown to the model.
+   * See AgentToolSignal.
+   */
+  signal?: AgentToolSignal;
 }
 
 export interface AgentTool {
@@ -44,6 +83,12 @@ export interface AgentRunResult {
   stopReason: LlmStopReason;
   /** Model calls made, including the final text turn. */
   iterations: number;
+  /**
+   * Signals raised by tools during the run, in the order they occurred and
+   * de-duplicated by kind+provider -- a model that calls search_github twice
+   * should not produce two sign-in cards.
+   */
+  signals: AgentToolSignal[];
 }
 
 const DEFAULT_MAX_ITERATIONS = 5;
@@ -57,6 +102,11 @@ export async function runAgent(options: RunAgentOptions): Promise<AgentRunResult
   const messages: LlmMessage[] = [...options.messages];
   const toolDefinitions = tools.map((tool) => tool.definition);
   const byName = new Map(tools.map((tool) => [tool.definition.name, tool] as const));
+
+  // Keyed so a repeated tool call cannot produce a repeated card. Insertion
+  // order is preserved, which is what the response layer wants if a turn ever
+  // raises more than one kind of signal.
+  const signals = new Map<string, AgentToolSignal>();
 
   for (let round = 1; round <= maxIterations; round++) {
     const response = await provider.complete({
@@ -74,7 +124,12 @@ export async function runAgent(options: RunAgentOptions): Promise<AgentRunResult
     );
 
     if (response.stopReason !== "tool_use" || toolCalls.length === 0) {
-      return { text: response.text, stopReason: response.stopReason, iterations: round };
+      return {
+        text: response.text,
+        stopReason: response.stopReason,
+        iterations: round,
+        signals: [...signals.values()],
+      };
     }
 
     messages.push({
@@ -85,6 +140,13 @@ export async function runAgent(options: RunAgentOptions): Promise<AgentRunResult
 
     for (const call of toolCalls) {
       const result = await executeTool(byName, call.name, call.input, logger);
+
+      if (result.signal) {
+        signals.set(`${result.signal.kind}:${result.signal.provider}`, result.signal);
+      }
+
+      // Note what is NOT forwarded: `signal`. It is for the response layer
+      // only, and the model is given the tool's prose exactly as before.
       messages.push({
         role: "tool",
         toolCallId: call.id,
@@ -105,6 +167,10 @@ export async function runAgent(options: RunAgentOptions): Promise<AgentRunResult
     text: final.text,
     stopReason: final.stopReason,
     iterations: maxIterations + 1,
+    // Signals raised before the cap still stand: a user who needs to connect
+    // GitHub needs to connect it whether or not the model then talked itself
+    // out of iterations.
+    signals: [...signals.values()],
   };
 }
 

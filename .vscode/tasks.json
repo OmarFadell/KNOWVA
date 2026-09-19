@@ -188,6 +188,7 @@
       "dependsOn": [
         "Validate prerequisites",
         "Start local tunnel",
+        "Use persistent tunnel (optional)",
         "Provision",
         "Deploy",
         "Start application"
@@ -237,6 +238,52 @@
       "problemMatcher": "$teamsfx-local-tunnel-watch"
     },
     {
+      // Opt in to a persistent dev tunnel, whose hostname does not change between
+      // debug sessions.
+      //
+      // WHY IT IS A SEPARATE TASK RATHER THAN AN EDIT TO "Start local tunnel":
+      // that task is type "teamsfx", a Toolkit-provided task type. A shell task
+      // cannot invoke, replace or conditionally skip one, and tasks.json has no
+      // conditionals -- dependsOn is a static list. So the only way to leave the
+      // ephemeral path *exactly* as it was is to let it run and then correct what
+      // it wrote. That is what this does, and it must stay AFTER the tunnel task
+      // and BEFORE Provision.
+      //
+      // With PERSISTENT_TUNNEL_HOST unset in env/.env.local this task prints one
+      // line and exits, changing nothing.
+      //
+      // With it set, the ephemeral tunnel created just above is redundant. If you
+      // would rather not create it at all, delete "Start local tunnel" from the
+      // "Start App Locally" and "Start App in Desktop Client" chains below -- this
+      // task does not depend on it having run.
+      "label": "Use persistent tunnel (optional)",
+      "type": "shell",
+      // `powershell` (Windows PowerShell 5.1), not `pwsh` -- PowerShell 7 is not
+      // installed on this machine, and this task has to work as-is. The script is
+      // written to 5.1 syntax so it runs under either.
+      "command": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/use-persistent-tunnel.ps1",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "isBackground": true,
+      "problemMatcher": {
+        "pattern": {
+          "regexp": "^.*$",
+          "file": 0,
+          "location": 1,
+          "message": 2
+        },
+        "background": {
+          "activeOnStart": true,
+          "beginsPattern": ".*",
+          // Printed by the script on both paths -- the ephemeral no-op and the
+          // persistent host. A background task that never signals readiness
+          // leaves the whole F5 chain waiting.
+          "endsPattern": "PERSISTENT_TUNNEL_TASK_READY"
+        }
+      }
+    },
+    {
       // Create the debug resources.
       // See https://aka.ms/teamsfx-tasks/provision to know the details and how to customize the args.
       "label": "Provision",
@@ -283,6 +330,7 @@
       "dependsOn": [
         "Validate prerequisites",
         "Start local tunnel",
+        "Use persistent tunnel (optional)",
         "Provision",
         "Deploy",
         "Start application",

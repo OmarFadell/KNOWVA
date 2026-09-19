@@ -1,6 +1,6 @@
 import { stripMentionsText, TokenCredentials, TypingActivityInput } from "@microsoft/teams.api";
 import type { ActivityLike } from "@microsoft/teams.api";
-import { App } from "@microsoft/teams.apps";
+import { App, ExpressAdapter } from "@microsoft/teams.apps";
 import { LocalStorage } from "@microsoft/teams.common";
 import type { ILogger } from "@microsoft/teams.common";
 import type { Client as GraphClient } from "@microsoft/teams.graph";
@@ -14,11 +14,33 @@ import type { LlmMessage } from "./src/llm";
 import { appendToHistory, clearHistory, getHistory } from "./src/llm/history";
 import { buildSystemPrompt } from "./src/llm/prompt";
 import { runAgent } from "./src/agent";
+import type { AgentToolSignal } from "./src/agent";
 import { createSharePointSearchTool } from "./src/tools/sharepoint-search";
 import { createDocumentMetadataTool } from "./src/tools/document-metadata";
 import { createConversationSearchTool } from "./src/tools/conversation-search";
+import { createEmailAccess } from "./src/tools/email-access";
+import { createEmailSearchTool } from "./src/tools/email-search";
+import { createEmailContentTool } from "./src/tools/email-content";
+import { createGitHubSearchTool } from "./src/tools/github";
+import { createGitHubContentTool } from "./src/tools/github-content";
+import { createActingIdentityResolver } from "./src/auth/acting-identity";
+import {
+  buildSignInUrl,
+  connectedLogin,
+  isGitHubConfigured,
+  registerGitHubOAuthRoutes,
+  signOut,
+} from "./src/auth/github";
+import { gitHubSignInCard } from "./src/teams/github-signin-card";
+import {
+  disableEmailForUser,
+  enableEmailForUser,
+  isEmailDisabledForUser,
+} from "./src/user/email-preferences";
 import {
   groupChatWelcomeMessage,
+  personalWelcomeMessage,
+  helpMessage,
   isGroupConversation,
   pauseConversation,
   resumeConversation,
@@ -63,9 +85,19 @@ const tokenCredentials: TokenCredentials = {
 const credentialOptions =
   config.MicrosoftAppType === "UserAssignedMsi" ? { ...tokenCredentials } : undefined;
 
+// The HTTP layer, held explicitly rather than left to the App to construct.
+//
+// This is the same ExpressAdapter the App would have created for itself -- same
+// HttpServer, same /api/messages registration, same Bot Framework JWT
+// validation. The only difference is that we keep the reference, which is what
+// makes it possible to mount the GitHub OAuth callback on the same server and
+// the same port. Nothing about Teams SSO changes.
+const httpAdapter = new ExpressAdapter();
+
 // Create the app with storage
 const app = new App({
   ...credentialOptions,
+  httpServerAdapter: httpAdapter,
   storage,
   skipAuth: !process.env.CLIENT_ID,
   oauth: {
@@ -74,6 +106,13 @@ const app = new App({
     defaultConnectionName: process.env.AAD_APP_OAUTH_CONNECTION_NAME || "graph",
   },
 });
+
+// The GitHub OAuth callback, mounted on the same server and port as
+// /api/messages but NOT behind the Teams JWT middleware -- the caller is a
+// browser following a redirect from github.com and has no Teams token to
+// present. src/auth/github.ts explains why that is safe (single-use,
+// server-side, short-lived state) and no-ops when no GitHub App is configured.
+registerGitHubOAuthRoutes(httpAdapter, app.log);
 
 // Interface for conversation state
 interface ConversationState {
@@ -103,6 +142,15 @@ interface PendingSignin {
    */
   conversationContext?: string | null;
   tenantId?: string;
+  /**
+   * The asker's Entra object id, captured on the message turn. Carried across
+   * the exchange because the email opt-out is checked against it, and the
+   * signin event's activity is a different activity from the one that asked the
+   * question -- reading `from` off the wrong one would check the wrong person.
+   */
+  aadObjectId?: string;
+  /** Whether the question was asked in a group chat, where replies are public. */
+  inGroupChat?: boolean;
 }
 
 // Keyed per user, not per conversation: in a group chat several people can each
@@ -126,6 +174,14 @@ async function respondWithLlm(
     conversationContext?: string | null;
     /** Used to build message deep links that resolve for multi-tenant users. */
     tenantId?: string;
+    /**
+     * `activity.from.aadObjectId` for whoever asked. The email tools check the
+     * per-user opt-out against this as well as against the identity they read
+     * back from the token itself -- see src/tools/email-access.ts.
+     */
+    aadObjectId?: string;
+    /** Replies are visible to the whole room, which changes the email rules. */
+    inGroupChat?: boolean;
   } = {}
 ): Promise<void> {
   // Teams shows nothing at all while we wait on Graph and the model, and a model
@@ -142,9 +198,15 @@ async function respondWithLlm(
   // address the user directly. Losing the name should degrade the reply, not
   // cost the user their answer, so this failure is non-fatal.
   let displayName = "the user";
+  let actingUserId: string | undefined;
   try {
     const me = await getMe(graph);
     displayName = me.displayName;
+    // Reused as the acting identity for the email opt-out check, purely to save
+    // the email tools a second /me round trip. If this call failed, they resolve
+    // it themselves rather than skipping the check -- losing the name may degrade
+    // a reply, but losing the identity must not weaken a privacy control.
+    actingUserId = me.id;
   } catch (err) {
     log.error("graph: /me failed, answering without the user's name", describeError(err), err);
   }
@@ -161,10 +223,45 @@ async function respondWithLlm(
   // out *which* chats to look in, but reads the messages with the bot's own
   // app-only token, because RSC grants are application permissions. See
   // src/tools/conversation-search.ts for why it needs both.
+  //
+  // The email tools are delegated too, and emphatically only delegated: there is
+  // no app-only mail path anywhere, because an application Mail.Read grant is
+  // tenant-wide over every mailbox in the org. So search_emails can reach this
+  // user's mailbox and nothing else -- which is also why the opt-out below can
+  // check "the person chatting" and be checking the right person.
+  //
+  // The two email tools share one EmailAccess: it memoises the acting identity
+  // and the opt-out decision for the turn, so a search-then-read chain costs one
+  // identity resolution rather than two, and cannot answer the "may we?"
+  // question differently on the second call than it did on the first.
+  const emailAccess = createEmailAccess({
+    graph,
+    chattingUserId: options.aadObjectId,
+    actingUserId,
+    log,
+  });
+
+  // search_github needs the same question answered -- whose credentials is this
+  // turn allowed to spend? -- but the stakes differ. For email, Graph refuses
+  // anyway if we get it wrong. For GitHub the token IS the authority, so this
+  // resolver cross-checks the token's own identity against the one Teams put on
+  // the activity and refuses if they disagree. See src/auth/acting-identity.ts.
+  // Both GitHub tools share it, so a search-then-read chain resolves once.
+  const gitHubIdentity = createActingIdentityResolver({
+    graph,
+    claimedUserId: options.aadObjectId,
+    resolvedUserId: actingUserId,
+    log,
+  });
+
   const tools = [
     createSharePointSearchTool(graph, config.sharePointSiteUrl, log),
     createDocumentMetadataTool(graph, log),
     createConversationSearchTool(graph, options.tenantId, log),
+    createEmailSearchTool(graph, emailAccess, log),
+    createEmailContentTool(graph, emailAccess, log),
+    createGitHubSearchTool(gitHubIdentity, log),
+    createGitHubContentTool(gitHubIdentity, log),
   ];
 
   try {
@@ -172,6 +269,7 @@ async function respondWithLlm(
       provider: llm,
       system: buildSystemPrompt(displayName, {
         conversationContext: options.conversationContext,
+        inGroupChat: options.inGroupChat,
       }),
       // History is committed only after a successful reply, so a failed turn
       // cannot leave an unanswered user message behind to confuse the next one.
@@ -196,12 +294,63 @@ async function respondWithLlm(
     const reply = result.text || "I couldn't put a reply together for that. Try asking again.";
     appendToHistory(conversationId, userMessage, { role: "assistant", content: reply });
     await send(reply);
+
+    // THE ONE PLACE A TOOL GETS TO DRIVE THE UI.
+    //
+    // A tool that needs the user to authorize something cannot say so in prose
+    // alone: the authorize URL is single-use, expires in minutes, and belongs
+    // to one person, so it must not pass through the model. search_github
+    // therefore raises a signal (see AgentToolSignal in src/agent/loop.ts) and
+    // the card is attached here, after the model's own explanation.
+    //
+    // Sent as a second activity rather than merged into the reply because the
+    // reply has already gone out by this point -- and because a card that
+    // arrives under the explanation reads as an answer to it.
+    await sendAuthCards(result.signals, send, options.aadObjectId, log);
   } catch (err) {
     log.error(`llm: ${llm.name}/${llm.model} request failed`, describeError(err), err);
     await send(
       "I couldn't reach my language model just then -- that's a problem on my side, not yours. " +
         "Give it a moment and try again."
     );
+  }
+}
+
+/**
+ * Turns `needs-auth` signals into sign-in cards.
+ *
+ * Best-effort throughout: the user already has the model's explanation, so a
+ * card that cannot be built or cannot be sent must degrade to "no button"
+ * rather than throwing away the answer that was already delivered.
+ */
+async function sendAuthCards(
+  signals: AgentToolSignal[],
+  send: (activity: ActivityLike) => Promise<unknown>,
+  aadObjectId: string | undefined,
+  log: ILogger
+): Promise<void> {
+  for (const signal of signals) {
+    if (signal.kind !== "needs-auth" || signal.provider !== "github") continue;
+
+    // The sign-in URL is bound to a specific user, so without an identity there
+    // is nobody to bind it to. The tool has already told the model to explain
+    // the situation; this just declines to offer a button that could not work.
+    if (!aadObjectId) {
+      log.warn("github-auth: cannot offer a sign-in card without an aadObjectId for the user");
+      continue;
+    }
+
+    const url = buildSignInUrl(aadObjectId);
+    if (!url) {
+      log.warn("github-auth: sign-in requested but no GitHub App is configured");
+      continue;
+    }
+
+    try {
+      await send(gitHubSignInCard(url));
+    } catch (err) {
+      log.error("github-auth: failed to send the sign-in card", describeError(err), err);
+    }
   }
 }
 
@@ -253,9 +402,109 @@ app.on("message", async (context) => {
     return;
   }
 
+  // THE EMAIL OPT-OUT, handled here with /pause rather than below with /reset.
+  //
+  // Two reasons for the position. It has to work while a conversation is
+  // paused, exactly as /resume does -- a privacy control you can lock yourself
+  // out of is not one. And it must not need an @mention in a group chat: this
+  // is about somebody's mailbox, and making them address the bot in front of
+  // the room to switch it off is the wrong shape entirely.
+  //
+  // The flag is per user and global, not per conversation: it is keyed on the
+  // Entra object id, so running this anywhere disables email search for that
+  // person everywhere. See src/user/email-preferences.ts.
+  if (text === "/disable-email" || text === "/enable-email") {
+    const userId = activity.from.aadObjectId;
+
+    if (!userId) {
+      // Rare -- Teams omits aadObjectId on some surfaces. Refusing is the only
+      // honest answer: writing the flag under a Teams-surface id would record a
+      // preference the Graph-side check could never find, which is worse than
+      // saying it did not work.
+      context.log.warn(
+        "email-preferences: no aadObjectId on the activity; cannot record the preference " +
+          `(conversation=${conversationId} user=${activity.from.id})`
+      );
+      await context.send(
+        "I couldn't work out who you are just then, so I haven't changed anything. " +
+          "Try again in a moment -- and if it keeps happening, message me directly rather than " +
+          "in a group chat."
+      );
+      return;
+    }
+
+    if (text === "/disable-email") {
+      disableEmailForUser(userId);
+      context.log.info(`email-preferences: email search disabled for user ${userId}`);
+      await context.send(
+        "Done -- I won't search your email any more. That applies everywhere, not just in this " +
+          "chat, and it takes effect before I make any request to Outlook. Say **/enable-email** " +
+          "to turn it back on.\n\n" +
+          "One honest caveat: I keep this setting in memory, so it can be forgotten if I'm " +
+          "restarted or redeployed. If that matters to you, check with **/disable-email** again " +
+          "after an update."
+      );
+      return;
+    }
+
+    enableEmailForUser(userId);
+    context.log.info(`email-preferences: email search re-enabled for user ${userId}`);
+    await context.send(
+      "Ok -- I can search your email again. That covers your Inbox and Sent Items only; " +
+        "never drafts, deleted mail, or anyone else's mailbox. **/disable-email** switches it " +
+        "back off."
+    );
+    return;
+  }
+
   // Everything past here is a reply. In a group chat that means Knowva was
   // @mentioned; other people's messages stop here, having been remembered.
   if (!shouldRespond(activity)) {
+    return;
+  }
+
+  // GitHub sign-out. Sits with the email opt-out rather than with /reset for the
+  // same reasons: it is a credential control, so it must work in a paused
+  // conversation and must not require an @mention in front of a room.
+  //
+  // NOTE THE LIMIT, which the reply states plainly: this forgets Knowva's copy
+  // of the token, it does not revoke the authorization at GitHub. Only the user
+  // can do that, from their GitHub settings, and pretending otherwise would be
+  // the kind of half-truth that matters for a credential.
+  if (text === "/github-signout") {
+    const userId = activity.from.aadObjectId;
+
+    if (!userId) {
+      await context.send(
+        "I couldn't work out who you are just then, so I haven't changed anything. Try again in " +
+          "a moment."
+      );
+      return;
+    }
+
+    const had = signOut(userId);
+    context.log.info(
+      `github-auth: sign-out requested by ${userId} (had a session: ${had})`
+    );
+
+    await context.send(
+      (had
+        ? "Done -- I've forgotten your GitHub connection and won't search GitHub as you any more."
+        : "You weren't connected to GitHub, so there was nothing to disconnect.") +
+        "\n\nTo fully revoke my access, remove the KnowvaGithubApp authorization in your " +
+        "GitHub settings -- signing out here only clears my copy of the token."
+    );
+    return;
+  }
+
+  if (text === "/help") {
+    const userId = activity.from.aadObjectId;
+    await context.send(
+      helpMessage(isEmailDisabledForUser(userId), {
+        configured: isGitHubConfigured(),
+        login: userId ? connectedLogin(userId) : undefined,
+      })
+    );
     return;
   }
 
@@ -312,7 +561,12 @@ app.on("message", async (context) => {
       withSendRetry((a) => context.send(a), context.log),
       text,
       conversationId,
-      { conversationContext, tenantId }
+      {
+        conversationContext,
+        tenantId,
+        aadObjectId: activity.from.aadObjectId,
+        inGroupChat: inGroup,
+      }
     );
     return;
   }
@@ -329,6 +583,8 @@ app.on("message", async (context) => {
     count: state.count,
     conversationContext,
     tenantId,
+    aadObjectId: activity.from.aadObjectId,
+    inGroupChat: inGroup,
   } as PendingSignin);
 
   try {
@@ -345,7 +601,12 @@ app.on("message", async (context) => {
         withSendRetry((a) => context.send(a), context.log),
         text,
         conversationId,
-        { conversationContext, tenantId }
+        {
+          conversationContext,
+          tenantId,
+          aadObjectId: activity.from.aadObjectId,
+          inGroupChat: inGroup,
+        }
       );
       return;
     }
@@ -385,26 +646,29 @@ app.on("message", async (context) => {
 app.on("install.add", async (context) => {
   const activity = context.activity;
 
-  // Personal installs are the existing 1:1 experience and already covered by
-  // the app's own description; only the group case is a disclosure to a room of
-  // people who did not individually opt in.
-  if (!isGroupConversation(activity)) return;
+  // Personal installs used to be skipped here, on the grounds that the 1:1
+  // experience was covered by the app's own store description. Outlook mail
+  // changed that: the description does not mention email, nobody clicks
+  // anything to grant it, and the opt-out is worthless if the only people who
+  // learn about it are the ones who already knew to ask. So both surfaces now
+  // get a disclosure, and both name /disable-email and /help.
+  const inGroup = isGroupConversation(activity);
 
   context.log.info(
-    `install: added to a group conversation ` +
+    `install: added to a ${inGroup ? "group" : "personal"} conversation ` +
       `(conversation=${activity.conversation.id} by=${activity.from.id})`
   );
 
   try {
     await withSendRetry((a: ActivityLike) => context.send(a), context.log)(
-      groupChatWelcomeMessage()
+      inGroup ? groupChatWelcomeMessage() : personalWelcomeMessage()
     );
   } catch (err) {
     // Worth an error, not a crash. The install succeeded and RSC is granted
     // either way -- but the chat now has a bot reading it that never announced
     // itself, which is precisely the situation the message exists to prevent.
     context.log.error(
-      `install: failed to post the group-chat disclosure to ${activity.conversation.id}`,
+      `install: failed to post the welcome disclosure to ${activity.conversation.id}`,
       describeError(err),
       err
     );
@@ -439,7 +703,14 @@ app.event("signin", async (context) => {
     withSendRetry((a) => context.send(a), context.log),
     pending.text,
     activity.conversation.id,
-    { conversationContext: pending.conversationContext, tenantId: pending.tenantId }
+    {
+      conversationContext: pending.conversationContext,
+      tenantId: pending.tenantId,
+      // From the message turn, not from this signin activity. They are different
+      // activities and only the first one identifies who actually asked.
+      aadObjectId: pending.aadObjectId,
+      inGroupChat: pending.inGroupChat,
+    }
   );
 });
 

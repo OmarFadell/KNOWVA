@@ -39,8 +39,29 @@ param teamsAppId string
 @description('Full URL of the SharePoint site the search_documents tool queries (SHAREPOINT_SITE_URL). Not a secret. Deployment fails if empty, because the app cannot start without it.')
 param sharePointSiteUrl string
 
+@description('GitHub App client id for the search_github tool (GITHUB_CLIENT_ID). Empty disables GitHub search; the tool then says so in plain language rather than the app failing to start.')
+param githubClientId string = ''
+
+@secure()
+@description('GitHub App client secret (SECRET_GITHUB_CLIENT_SECRET). Marked @secure() so it is redacted from deployment history and portal output. Key Vault is the eventual home, same as the Anthropic key.')
+param githubClientSecret string = ''
+
+@description('Optional shared/project mailboxes search_emails may be pointed at (SHARED_MAILBOXES), as "Display Name=address@domain" pairs separated by ";". Not a secret. Empty is the intended default: with nothing here, the email tools can only ever reach the mailbox of whoever is asking. Naming a mailbox grants nothing by itself -- every read still runs on that user delegated token under Mail.Read.Shared, so Exchange decides per user whether they may open it.')
+param sharedMailboxes string = ''
+
 // F1 (Free) does not support Always On -- setting it true makes the deployment fail.
 var alwaysOnSupported = webAppSku != 'F1'
+
+// The site's own public hostname, composed rather than read back from
+// webApp.properties.defaultHostName, because a resource cannot reference its own
+// properties from inside its own definition -- which is what an appSettings
+// entry would be doing. The outputs at the bottom of this file use the real
+// property; this is only for the setting the app reads at runtime.
+//
+// Assumes the public cloud's azurewebsites.net suffix, as does everything else
+// here (see msaAppType: 'SingleTenant' in the bot registration). A sovereign
+// cloud deployment would need this and the CLOUD env var changed together.
+var webAppDomain = '${webAppName}.azurewebsites.net'
 
 resource serverfarm 'Microsoft.Web/serverfarms@2021-02-01' = {
   kind: 'app'
@@ -111,6 +132,25 @@ resource webApp 'Microsoft.Web/sites@2021-02-01' = {
         {
           name: 'SHAREPOINT_SITE_URL'
           value: sharePointSiteUrl
+        }
+        {
+          name: 'SHARED_MAILBOXES'
+          value: sharedMailboxes
+        }
+        {
+          name: 'GITHUB_CLIENT_ID'
+          value: githubClientId
+        }
+        {
+          name: 'GITHUB_CLIENT_SECRET'
+          value: githubClientSecret
+        }
+        // The public origin the GitHub OAuth callback comes back to. config.ts
+        // derives the full callback URL from it, and it must match a Callback
+        // URL registered on the GitHub App.
+        {
+          name: 'BOT_DOMAIN'
+          value: webAppDomain
         }
         {
           name: 'TEAMS_APP_ID'

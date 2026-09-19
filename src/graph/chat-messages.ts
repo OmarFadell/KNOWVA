@@ -148,8 +148,13 @@ function toRecord(message: GraphChatMessage, chatId: string): ChatMessageRecord 
 /**
  * Chat bodies come back as either plain text or Teams-flavoured HTML. Strip to
  * text so keyword matching and the model see the same thing a person reads.
+ *
+ * Exported because src/graph/mail.ts needs the same job done on email bodies.
+ * It wraps rather than copies this: email HTML carries things Teams HTML never
+ * does (a <head>, conditional comments, tracking markup), which mail.ts strips
+ * first before delegating here for the shared tag/entity work.
  */
-function bodyToText(content: string, contentType?: string): string {
+export function bodyToText(content: string, contentType?: string): string {
   if (!content) return "";
   if (contentType !== "html") return content.trim();
 

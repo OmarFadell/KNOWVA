@@ -32,6 +32,15 @@
     "sharePointSiteUrl": {
       "value": "${{SHAREPOINT_SITE_URL}}"
     },
+    "sharedMailboxes": {
+      "value": "${{SHARED_MAILBOXES}}"
+    },
+    "githubClientId": {
+      "value": "${{SECRET_GITHUB_CLIENT_ID}}"
+    },
+    "githubClientSecret": {
+      "value": "${{SECRET_GITHUB_CLIENT_SECRET}}"
+    },
     "teamsAppId": {
       "value": "${{TEAMS_APP_ID}}"
     }

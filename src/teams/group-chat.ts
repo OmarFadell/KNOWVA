@@ -130,6 +130,91 @@ export function groupChatWelcomeMessage(): string {
     "in the chat can @mention me to ask a question. I won't chime in unless I'm mentioned. " +
     "When I use something from this conversation I'll say who said it and when, and link to " +
     "the message. Use **/pause** if you want me to stop reading for a while, or remove me " +
-    "from the chat to stop it for good -- once I'm removed I lose access entirely."
+    "from the chat to stop it for good -- once I'm removed I lose access entirely.\n\n" +
+    "I can also search whoever asks me a question in **their own** Outlook inbox and sent " +
+    "mail -- never yours, never anyone else's, and never drafts or deleted mail. If you'd " +
+    "rather I never touched your mailbox, say **/disable-email** and I won't. **/help** " +
+    "lists everything."
   );
+}
+
+/**
+ * What Knowva says when somebody installs it for themselves, in a 1:1 chat.
+ *
+ * This did not exist before Outlook mail, and it exists now for one reason:
+ * installing the app is what grants mail access, nobody clicks anything else,
+ * and the store description says nothing about email. A user who never learns
+ * Knowva can read their mailbox has not really opted into anything -- and an
+ * opt-out only they can find by asking is not an opt-out.
+ *
+ * Same job as the group-chat disclosure, then: four facts and the way out, in
+ * one short paragraph. Longer gets skimmed.
+ */
+export function personalWelcomeMessage(): string {
+  return (
+    "Hi -- I'm Knowva. Ask me anything and I'll answer from what I can reach: our SharePoint " +
+    "documents, the Teams group chats I've been added to, and your Outlook email.\n\n" +
+    "About email specifically, since it's your mailbox: I search your **Inbox and Sent Items " +
+    "only** -- never drafts, never deleted mail, never anyone else's mailbox -- and I read " +
+    "attachment filenames but never open the files. I always tell you who sent something and " +
+    "when. If you'd rather I didn't read your mail at all, say **/disable-email** and I'll " +
+    "stop; **/enable-email** turns it back on.\n\n" +
+    "**/help** lists what I can do and every command."
+  );
+}
+
+/**
+ * The /help reply.
+ *
+ * Takes the caller's current email setting rather than describing both states,
+ * so somebody who has switched email off is told that it *is* off -- the case
+ * where a wrong answer would matter most, because it would leave them believing
+ * their mail was still being read.
+ */
+export interface GitHubHelpState {
+  /** False when no GitHub App is configured on this deployment. */
+  configured: boolean;
+  /** The connected GitHub login, when this user has one. */
+  login?: string;
+}
+
+export function helpMessage(emailDisabled: boolean, github?: GitHubHelpState): string {
+  const emailLine = emailDisabled
+    ? "- **Email** -- currently **switched off** for you. Say **/enable-email** to turn it back on."
+    : "- **Email** -- your Outlook Inbox and Sent Items. Never drafts, deleted mail, or anyone " +
+      "else's mailbox. I read attachment filenames, never the files. Say **/disable-email** to " +
+      "switch this off for you everywhere.";
+
+  // Omitted entirely when no GitHub App is configured: offering a command that
+  // cannot work is worse than not mentioning the feature.
+  const gitHubLine = !github?.configured
+    ? null
+    : github.login
+      ? `- **GitHub** -- connected as **${github.login}**. I search code, repos, issues and ` +
+        "pull requests you already have access to. **/github-signout** disconnects."
+      : "- **GitHub** -- not connected yet. Ask me something about a repo and I'll show you a " +
+        "button to connect. You'll only ever see repositories your own GitHub account can.";
+
+  return [
+    "Here's what I can do:",
+    "",
+    "- **Documents** -- search our configured SharePoint site, and tell you when a document was " +
+      "last changed and by whom.",
+    "- **Conversations** -- search recent messages in the Teams group chats I've been added to " +
+      "and that you're in. I always say who said what, when, and link to it.",
+    emailLine,
+    ...(gitHubLine ? [gitHubLine] : []),
+    "",
+    "Commands:",
+    "",
+    "- **/help** -- this message",
+    "- **/disable-email** / **/enable-email** -- turn email search off or back on, for you, everywhere",
+    ...(github?.configured
+      ? ["- **/github-signout** -- disconnect my access to your GitHub account"]
+      : []),
+    "- **/pause** / **/resume** -- stop or restart me reading this conversation",
+    "- **/reset** -- forget what we've discussed here",
+    "",
+    "I can't send email, edit anything, read your calendar, or open attachments. I'm read-only.",
+  ].join("\n");
 }

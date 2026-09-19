@@ -23,6 +23,77 @@ function requireEnv(name: string, because: string): string {
   return value;
 }
 
+/**
+ * One entry from SHARED_MAILBOXES: a human-facing name the model can pass to
+ * search_emails, and the SMTP address it resolves to.
+ */
+export interface SharedMailbox {
+  /** Display name, e.g. "Project Alpha". Matched case-insensitively. */
+  name: string;
+  /** SMTP address the Graph call is made against, e.g. projectalpha@contoso.com. */
+  address: string;
+}
+
+/**
+ * Parses SHARED_MAILBOXES: a `;`-separated list of `Display Name=address` pairs.
+ *
+ *   SHARED_MAILBOXES="Project Alpha=projectalpha@contoso.com;Support=support@contoso.com"
+ *
+ * Optional -- unset means the email tools can only ever reach the asking user's
+ * own mailbox, which is the intended default. But a *malformed* entry throws at
+ * startup rather than being skipped: somebody who set this variable meant to
+ * open a mailbox, and silently dropping their typo would leave them wondering
+ * why the model keeps saying that mailbox does not exist.
+ *
+ * Naming a mailbox here grants nothing by itself. Every read still goes out on
+ * the asking user's delegated token under Mail.Read.Shared, so Exchange decides
+ * per user whether they may open it. This list only bounds *which* mailboxes
+ * Knowva will ever ask for.
+ */
+function parseSharedMailboxes(raw: string | undefined): SharedMailbox[] {
+  if (!raw || !raw.trim()) return [];
+
+  return raw
+    .split(";")
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .map((entry) => {
+      const separator = entry.indexOf("=");
+      const name = separator === -1 ? "" : entry.slice(0, separator).trim();
+      const address = separator === -1 ? "" : entry.slice(separator + 1).trim();
+
+      if (!name || !address || !address.includes("@")) {
+        throw new Error(
+          `Malformed SHARED_MAILBOXES entry "${entry}". Expected ` +
+            `"Display Name=address@domain", with entries separated by ";" -- e.g. ` +
+            `SHARED_MAILBOXES="Project Alpha=projectalpha@contoso.com;Support=support@contoso.com".`
+        );
+      }
+
+      return { name, address };
+    });
+}
+
+/**
+ * Works out the public origin the GitHub OAuth callback will arrive on.
+ * Returns "" when nothing is known, which src/auth/github.ts reports as
+ * "GitHub sign-in is not configured" rather than building a broken URL.
+ */
+function resolveGitHubOrigin(): string {
+  const explicit = process.env.GITHUB_OAUTH_ORIGIN?.trim();
+  if (explicit) return explicit.replace(/\/+$/, "");
+
+  // Local: the debug task writes the dev-tunnel URL here, scheme included.
+  const endpoint = process.env.BOT_ENDPOINT?.trim();
+  if (endpoint) return endpoint.replace(/\/+$/, "");
+
+  // Azure: hostname only, no scheme.
+  const domain = process.env.BOT_DOMAIN?.trim();
+  if (domain) return `https://${domain.replace(/^https?:\/\//, "").replace(/\/+$/, "")}`;
+
+  return "";
+}
+
 const config = {
   MicrosoftAppId: process.env.CLIENT_ID,
   MicrosoftAppType: process.env.BOT_TYPE,
@@ -71,6 +142,46 @@ const config = {
     "SHAREPOINT_SITE_URL",
     "the document-search tool has no site to query without it"
   ),
+
+  /**
+   * GitHub, for the search_github tool. Wholly optional, and modelled on
+   * appClientSecret above rather than on sharePointSiteUrl: a deployment with
+   * no GitHub App configured starts fine and the tool says so in plain language,
+   * because GitHub search is an addition rather than the reason Knowva exists.
+   *
+   * NOTE ON THE SECRET NAMES. The app reads GITHUB_CLIENT_ID /
+   * GITHUB_CLIENT_SECRET, which m365agents.local.yml writes into .localConfigs
+   * from SECRET_GITHUB_CLIENT_ID / SECRET_GITHUB_CLIENT_SECRET in
+   * env/.env.local.user -- exactly the indirection ANTHROPIC_API_KEY already
+   * uses. (A GitHub App client id is not actually a secret and could live in
+   * env/.env.local as plain config; it is carried as a SECRET_ for now so both
+   * halves of one credential sit in one place. Key Vault is the eventual home
+   * for the secret half, same as the Anthropic key.)
+   */
+  github: {
+    clientId: process.env.GITHUB_CLIENT_ID || "",
+    clientSecret: process.env.GITHUB_CLIENT_SECRET || "",
+    /**
+     * Public origin the GitHub OAuth callback lands on, no trailing slash.
+     *
+     * Derived rather than configured, because it is already known twice over:
+     * BOT_ENDPOINT is the dev-tunnel URL locally, BOT_DOMAIN is the App Service
+     * hostname on Azure. GITHUB_OAUTH_ORIGIN overrides both, for the case where
+     * the callback has to arrive somewhere other than the bot's own endpoint.
+     *
+     * THIS MUST MATCH A CALLBACK URL REGISTERED ON THE GITHUB APP, and the dev
+     * tunnel hostname changes every time the tunnel is recreated -- see
+     * src/auth/github.ts for what that means in practice.
+     */
+    oauthOrigin: resolveGitHubOrigin(),
+  },
+
+  // Optional, and deliberately so. With this unset, search_emails can only ever
+  // read the asking user's own mailbox -- the default source, and the one that
+  // needs no configuration. Each entry here adds an explicitly named shared or
+  // project mailbox as an opt-in alternative scope the model may be pointed at.
+  // Same shape as SHAREPOINT_SITE_URL: plain config, not a secret.
+  sharedMailboxes: parseSharedMailboxes(process.env.SHARED_MAILBOXES),
 };
 
 export default config;

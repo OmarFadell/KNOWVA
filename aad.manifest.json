@@ -26,6 +26,14 @@
         {
           "id": "9547fcb5-d03f-419d-9948-5928bbf71b0f",
           "type": "Scope"
+        },
+        {
+          "id": "570282fd-fa5c-430d-a7fd-fc8dc98a9dca",
+          "type": "Scope"
+        },
+        {
+          "id": "7b9103a5-4610-446b-9670-80643382c1fa",
+          "type": "Scope"
         }
       ]
     }
