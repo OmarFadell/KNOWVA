@@ -204,6 +204,16 @@ export function helpMessage(emailDisabled: boolean, github?: GitHubHelpState): s
       "and that you're in. I always say who said what, when, and link to it.",
     emailLine,
     ...(gitHubLine ? [gitHubLine] : []),
+    // Listed unconditionally, unlike the GitHub line above. That line is hidden
+    // when no GitHub App is configured because offering a command that cannot
+    // work is worse than not mentioning the feature -- but Atlassian config is
+    // not plumbed through to this function, and describing Confluence search is
+    // accurate for every deployment that has it. If a deployment without an
+    // Atlassian app ever needs this hidden too, pass state in the way
+    // GitHubHelpState already does rather than guessing here.
+    "- **Confluence** -- search and read pages you already have access to. Confluence applies " +
+      "your own permissions, so I can't see anything you can't. Connecting also lets me find " +
+      "Jira test items that mention you. **/jira-signout** disconnects.",
     "",
     "Commands:",
     "",
@@ -212,6 +222,7 @@ export function helpMessage(emailDisabled: boolean, github?: GitHubHelpState): s
     ...(github?.configured
       ? ["- **/github-signout** -- disconnect my access to your GitHub account"]
       : []),
+    "- **/jira-signout** -- disconnect my access to your Atlassian account (Confluence and Jira)",
     "- **/pause** / **/resume** -- stop or restart me reading this conversation",
     "- **/reset** -- forget what we've discussed here",
     "",

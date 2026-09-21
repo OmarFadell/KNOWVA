@@ -23,15 +23,25 @@ import { createEmailSearchTool } from "./src/tools/email-search";
 import { createEmailContentTool } from "./src/tools/email-content";
 import { createGitHubSearchTool } from "./src/tools/github";
 import { createGitHubContentTool } from "./src/tools/github-content";
+import { createXrayProjectsTool } from "./src/tools/xray-projects";
+import { createFindMyXrayItemsTool } from "./src/tools/find-my-xray-items";
+import {
+  createConfluencePageTool,
+  createConfluenceSearchTool,
+} from "./src/tools/confluence";
+import {
+  describeAtlassianSession,
+  registerAtlassianOAuthRoutes,
+  signOut as atlassianSignOut,
+} from "./src/auth/atlassian";
 import { createActingIdentityResolver } from "./src/auth/acting-identity";
 import {
-  buildSignInUrl,
   connectedLogin,
   isGitHubConfigured,
   registerGitHubOAuthRoutes,
   signOut,
 } from "./src/auth/github";
-import { gitHubSignInCard } from "./src/teams/github-signin-card";
+import { signInOffers } from "./src/teams/signin-cards";
 import {
   disableEmailForUser,
   enableEmailForUser,
@@ -113,6 +123,20 @@ const app = new App({
 // present. src/auth/github.ts explains why that is safe (single-use,
 // server-side, short-lived state) and no-ops when no GitHub App is configured.
 registerGitHubOAuthRoutes(httpAdapter, app.log);
+
+// The Atlassian OAuth callback, on the same server and with the same
+// justification as GitHub's -- the caller is a browser following a redirect
+// from auth.atlassian.com and has no Teams token to present.
+//
+// ONE SIGN-IN, TWO USES. It resolves which Atlassian account belongs to a Teams
+// user (which is all find_my_xray_items needs -- that search runs on the shared
+// Xray credential) AND retains a refreshable token, because Confluence enforces
+// real per-user permissions and so must be called as the user. The identity and
+// the credential are stored as separately disposable halves. See the header of
+// src/auth/atlassian.ts.
+//
+// No-ops when no Atlassian app is configured.
+registerAtlassianOAuthRoutes(httpAdapter, app.log);
 
 // Interface for conversation state
 interface ConversationState {
@@ -241,13 +265,20 @@ async function respondWithLlm(
     log,
   });
 
-  // search_github needs the same question answered -- whose credentials is this
-  // turn allowed to spend? -- but the stakes differ. For email, Graph refuses
-  // anyway if we get it wrong. For GitHub the token IS the authority, so this
-  // resolver cross-checks the token's own identity against the one Teams put on
-  // the activity and refuses if they disagree. See src/auth/acting-identity.ts.
-  // Both GitHub tools share it, so a search-then-read chain resolves once.
-  const gitHubIdentity = createActingIdentityResolver({
+  // The GitHub tools need the same question answered -- whose credentials is
+  // this turn allowed to spend? -- but the stakes differ. For email, Graph
+  // refuses anyway if we get it wrong. For GitHub the token IS the authority,
+  // so this resolver cross-checks the token's own identity against the one
+  // Teams put on the activity and refuses if they disagree. See
+  // src/auth/acting-identity.ts.
+  //
+  // Both GitHub tools share it, so a search-then-read chain resolves once and
+  // cannot answer the "who is this?" question differently on the second call
+  // than it did on the first.
+  //
+  // NOTE that list_xray_projects below is NOT given this resolver. That is not
+  // an omission -- it has no per-user dimension to resolve.
+  const externalIdentity = createActingIdentityResolver({
     graph,
     claimedUserId: options.aadObjectId,
     resolvedUserId: actingUserId,
@@ -260,8 +291,25 @@ async function respondWithLlm(
     createConversationSearchTool(graph, options.tenantId, log),
     createEmailSearchTool(graph, emailAccess, log),
     createEmailContentTool(graph, emailAccess, log),
-    createGitHubSearchTool(gitHubIdentity, log),
-    createGitHubContentTool(gitHubIdentity, log),
+    createGitHubSearchTool(externalIdentity, log),
+    createGitHubContentTool(externalIdentity, log),
+    // No identity resolver passed, and not by omission: list_xray_projects has
+    // no per-user dimension at all. One shared Xray credential, the same answer
+    // for everybody. See src/tools/xray-projects.ts.
+    createXrayProjectsTool(log),
+    // find_my_xray_items DOES take one, for a reason worth keeping straight:
+    // the search still runs on the shared Xray credential, but the *subject* of
+    // the search is a specific person. The resolver decides which Teams user we
+    // are looking up an Atlassian accountId for, and getting that wrong returns
+    // one person's items under another person's name.
+    createFindMyXrayItemsTool(externalIdentity, log),
+    // The Confluence tools take the resolver for the strongest reason any tool
+    // does: they spend a live per-user Confluence token, and picking the wrong
+    // one is undetectable from Confluence's side. Same stakes as GitHub. They
+    // share the resolver with everything else so a search-then-read chain
+    // resolves identity once and cannot answer it differently on the second call.
+    createConfluenceSearchTool(externalIdentity, log),
+    createConfluencePageTool(externalIdentity, log),
   ];
 
   try {
@@ -299,9 +347,10 @@ async function respondWithLlm(
     //
     // A tool that needs the user to authorize something cannot say so in prose
     // alone: the authorize URL is single-use, expires in minutes, and belongs
-    // to one person, so it must not pass through the model. search_github
-    // therefore raises a signal (see AgentToolSignal in src/agent/loop.ts) and
-    // the card is attached here, after the model's own explanation.
+    // to one person, so it must not pass through the model. A tool needing
+    // authorization therefore raises a signal (see AgentToolSignal in
+    // src/agent/loop.ts) and the card is attached here, after the model's own
+    // explanation.
     //
     // Sent as a second activity rather than merged into the reply because the
     // reply has already gone out by this point -- and because a card that
@@ -319,6 +368,14 @@ async function respondWithLlm(
 /**
  * Turns `needs-auth` signals into sign-in cards.
  *
+ * PROVIDER-AGNOSTIC. This used to test `signal.provider !== "github"` and
+ * import the GitHub URL builder and card directly, which was right while there
+ * was one provider and became an if/else ladder waiting to happen once there
+ * were two. The per-provider knowledge now lives in the registry in
+ * src/teams/signin-cards.ts, and this function only knows that a signal names
+ * a provider and that the registry can turn it into a button. Adding a third
+ * provider does not touch this file.
+ *
  * Best-effort throughout: the user already has the model's explanation, so a
  * card that cannot be built or cannot be sent must degrade to "no button"
  * rather than throwing away the answer that was already delivered.
@@ -330,26 +387,38 @@ async function sendAuthCards(
   log: ILogger
 ): Promise<void> {
   for (const signal of signals) {
-    if (signal.kind !== "needs-auth" || signal.provider !== "github") continue;
+    if (signal.kind !== "needs-auth") continue;
+
+    const offer = signInOffers[signal.provider];
+    if (!offer) {
+      log.warn(`auth: no sign-in card is registered for provider "${signal.provider}"`);
+      continue;
+    }
 
     // The sign-in URL is bound to a specific user, so without an identity there
     // is nobody to bind it to. The tool has already told the model to explain
     // the situation; this just declines to offer a button that could not work.
     if (!aadObjectId) {
-      log.warn("github-auth: cannot offer a sign-in card without an aadObjectId for the user");
+      log.warn(
+        `auth: cannot offer a ${signal.provider} sign-in card without an aadObjectId for the user`
+      );
       continue;
     }
 
-    const url = buildSignInUrl(aadObjectId);
+    const url = offer.buildUrl(aadObjectId);
     if (!url) {
-      log.warn("github-auth: sign-in requested but no GitHub App is configured");
+      log.warn(`auth: ${signal.provider} sign-in requested but that provider is not configured`);
       continue;
     }
 
     try {
-      await send(gitHubSignInCard(url));
+      await send(offer.card(url));
     } catch (err) {
-      log.error("github-auth: failed to send the sign-in card", describeError(err), err);
+      log.error(
+        `auth: failed to send the ${signal.provider} sign-in card`,
+        describeError(err),
+        err
+      );
     }
   }
 }
@@ -493,6 +562,73 @@ app.on("message", async (context) => {
         : "You weren't connected to GitHub, so there was nothing to disconnect.") +
         "\n\nTo fully revoke my access, remove the KnowvaGithubApp authorization in your " +
         "GitHub settings -- signing out here only clears my copy of the token."
+    );
+    return;
+  }
+
+  // Atlassian sign-out. Added when the Atlassian connection stopped being a
+  // one-shot identity lookup and started carrying a retained, refreshable
+  // Confluence credential -- at which point "how do I turn this off?" became a
+  // question the user is entitled to a straight answer to, exactly as it is for
+  // GitHub and for email.
+  //
+  // Same honesty as /github-signout: this clears Knowva's copy of the session,
+  // it does NOT revoke the grant at Atlassian. Only the user can do that, and
+  // pretending otherwise would leave them believing access was withdrawn when a
+  // live authorization still stands on their account.
+  //
+  // NOTE that this clears BOTH halves of the session -- the Confluence token and
+  // the cached Jira identity -- so find_my_xray_items will ask them to connect
+  // again too. That is the right behaviour for a command that reads as "forget
+  // my Atlassian connection", and it is worth knowing it is broader than the
+  // narrower drop that happens automatically when a refresh fails.
+  // Read-only diagnostic for the Atlassian connection.
+  //
+  // Added while chasing a 401 that had two indistinguishable causes: a token
+  // that genuinely lacked the Confluence scopes, and a token that had them all
+  // and was refused anyway. Those need opposite fixes, and the only thing that
+  // separates them is what the token was actually granted -- which was
+  // previously visible nowhere except a log line nobody knew to look for.
+  //
+  // Prints scopes, expiry and site. NEVER the token itself.
+  if (text === "/jira-debug") {
+    const userId = activity.from.aadObjectId;
+
+    if (!userId) {
+      await context.send(
+        "I couldn't work out who you are just then, so I can't look up your connection."
+      );
+      return;
+    }
+
+    await context.send(`**Atlassian connection**
+
+${describeAtlassianSession(userId)}`);
+    return;
+  }
+
+  if (text === "/jira-signout" || text === "/disconnect-jira") {
+    const userId = activity.from.aadObjectId;
+
+    if (!userId) {
+      await context.send(
+        "I couldn't work out who you are just then, so I haven't changed anything. Try again in " +
+          "a moment."
+      );
+      return;
+    }
+
+    const had = atlassianSignOut(userId);
+    context.log.info(`atlassian-auth: sign-out requested by ${userId} (had a session: ${had})`);
+
+    await context.send(
+      (had
+        ? "Done -- I've forgotten your Atlassian connection. I won't search Confluence as you " +
+          "any more, and I've also forgotten which Jira account is yours, so I can't find Jira " +
+          "items that mention you until you reconnect."
+        : "You weren't connected to Atlassian, so there was nothing to disconnect.") +
+        "\n\nTo fully revoke my access, remove Knowva under **Connected apps** in your Atlassian " +
+        "account settings -- signing out here only clears my copy of the session."
     );
     return;
   }

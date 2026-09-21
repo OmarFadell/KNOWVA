@@ -1,0 +1,596 @@
+/**
+ * ============================ PARKED ============================
+ *
+ * PARKED OUT OF THE BUILD -- .ts.parked, so tsc does not see this file.
+
+ * It was parked-but-compiling until src/auth/atlassian.ts became IDENTITY-ONLY.
+ * That rewrite removed getValidAccessToken, getAccessibleJiraSite and
+ * AtlassianTokenFailure -- the token-bearing API this file depends on -- because
+ * the current design resolves an accountId and then discards the token.
+ *
+ * So this file no longer compiles, and making it compile would mean putting
+ * token storage back, which is exactly what the current design removed. Rather
+ * than delete working code or reintroduce the contradiction, the extension is
+ * changed so it stays readable on disk and out of the compiler's way.
+ *
+ * TO REVIVE: rename back to .ts, restore the token-bearing half of
+ * src/auth/atlassian.ts (see that file's header, which says what was removed and
+ * why), add read:jira-work + offline_access back to ATLASSIAN_SCOPES, and mount
+ * registerAtlassianOAuthRoutes for data access rather than identity.
+ *
+ * ============================ ORIGINAL HEADER BELOW ============================
+ *
+ * This is the PER-USER version of the Xray milestone, superseded by the
+ * org-scoped src/tools/xray-projects.ts. It is not registered in app.ts and
+ * nothing calls it.
+ *
+ * WHY IT WAS SUPERSEDED, so nobody re-litigates it: this tool resolved the
+ * asking user's real Jira projects through their own Atlassian 3LO token, then
+ * checked each against Xray. That half worked. The half that does not is Xray
+ * itself -- Xray Cloud has no per-user auth model of any kind, so the Xray
+ * answer was always going to come from one shared service credential no matter
+ * how carefully the Jira half was scoped. The milestone was therefore re-scoped
+ * to be honestly org-level throughout: an admin-set XRAY_PROJECTS allowlist and
+ * one shared credential, with no per-user claim made anywhere.
+ *
+ * KEPT, NOT DELETED, because the Jira half is independently useful and is
+ * verified against Atlassian's current 3LO docs. A future "search Jira issues
+ * as the asking user" tool needs exactly this code. Deleting it would mean
+ * re-deriving the cloud-id step, the rotating-refresh-token handling and the
+ * project-search pagination from scratch.
+ *
+ * IF THIS IS REVIVED: it still imports from src/auth/atlassian.ts (also
+ * parked), and app.ts must mount registerAtlassianOAuthRoutes again -- see the
+ * commented note there. Do not revive it alongside list_xray_projects without
+ * deciding which one answers "which projects are available", because two tools
+ * answering that differently will confuse the model.
+ * ===============================================================================
+ */
+import type { ILogger } from "@microsoft/teams.common";
+import type { AgentTool, AgentToolResult } from "../agent/loop";
+import type { ActingIdentityResolver } from "../auth/acting-identity";
+import {
+  getAccessibleJiraSite,
+  getValidAccessToken,
+  isAtlassianConfigured,
+  type AtlassianTokenFailure,
+} from "../auth/atlassian";
+// checkXrayProject replaced the older countXrayTests when src/xray/client.ts
+// was reworked for the org-scoped milestone. It accepts a project KEY or a
+// numeric project id (getProjectSettings takes either), so passing the numeric
+// id this file already has from Jira still works unchanged.
+import { checkXrayProject, isXrayConfigured, type XrayFailure } from "../xray/client";
+import { describeError } from "../errors";
+
+/**
+ * The `list_accessible_projects` tool: which Jira projects can the person
+ * asking actually see, and which of those hold Xray test data.
+ *
+ * ===========================================================================
+ * THIS TOOL SPENDS TWO CREDENTIALS OF DIFFERENT KINDS, AND THE ORDER MATTERS.
+ *
+ *   1. THE USER'S OWN Jira OAuth token, to list projects. Jira applies their
+ *      real Browse Projects permission, so the list is exactly what they could
+ *      see by logging into Jira themselves. Same property, and the same
+ *      confused-deputy reasoning, as src/tools/github.ts.
+ *
+ *   2. A SHARED XRAY SERVICE CREDENTIAL, to ask whether a project has tests.
+ *      Xray Cloud offers no per-user auth of any kind (see the header of
+ *      src/xray/client.ts), so this one credential serves everybody and can
+ *      see more than any individual user.
+ *
+ * THE ORDER IS THE SAFETY PROPERTY. Step 1 runs first and bounds step 2: the
+ * shared credential is only ever asked about project ids that the user's OWN
+ * token already returned. It is never asked to enumerate. Reverse the order --
+ * ask Xray which projects have tests, then filter -- and Knowva would be
+ * deciding what to hide from a list the user was never entitled to receive,
+ * which is a much weaker position and leaks project existence through timing
+ * and error messages. Do not reverse it.
+ *
+ * A consequence worth stating plainly, because it will look like a bug: if the
+ * Xray API key's own Jira user cannot browse a project that the ASKING user
+ * can, the count comes back zero. The project is then reported as having no
+ * Xray data when it may well have some. That is a property of Xray having only
+ * app-level credentials, not something this tool can fix, and the output says
+ * so rather than quietly asserting "no tests".
+ * ===========================================================================
+ *
+ * DIAGNOSTIC BY DESIGN. This is a milestone checkpoint, not the Xray feature.
+ * It lists what is reachable; it does not search or fetch test data, and its
+ * description to the model is deliberately narrow so the model does not offer
+ * capabilities that do not exist yet.
+ *
+ * IT ALSO PRINTS TO THE CONSOLE. console.log, not log.info, and on purpose:
+ * the point of this milestone is to be able to read the raw result directly
+ * off the terminal while developing, without it being interleaved into the
+ * structured bot logs. The same content goes back to the model.
+ */
+
+/**
+ * How many projects to list. Jira's /project/search pages at 50; this bounds
+ * the whole answer, because the Xray phase costs one API call per project and
+ * Xray Standard allows 300 calls per 5 minutes. A user with more projects than
+ * this gets a truncated list and is told so.
+ */
+const MAX_PROJECTS = 50;
+
+/** Jira's own page size for /project/search. */
+const PAGE_SIZE = 50;
+
+/** Network budget per Jira call. */
+const REQUEST_TIMEOUT_MS = 15_000;
+
+/** One project as Jira describes it. */
+interface JiraProject {
+  /** Numeric project id, as a string. This is what Xray's getTests(projectId:) wants. */
+  id: string;
+  /** Project key, e.g. "ABC". */
+  key: string;
+  name: string;
+  projectTypeKey?: string;
+}
+
+/** A project plus the answer to "does it have Xray tests?". */
+interface ProjectXrayStatus {
+  project: JiraProject;
+  /** Number of Xray Tests, when the check succeeded. */
+  testCount?: number;
+  /** Set when the check could not be made for this project. */
+  failure?: XrayFailure;
+  detail?: string;
+}
+
+export function createJiraXrayProjectsTool(
+  identity: ActingIdentityResolver,
+  log: ILogger
+): AgentTool {
+  return {
+    definition: {
+      name: "list_accessible_projects",
+      description:
+        "Diagnostic. Lists the Jira projects the person you are talking to can access with " +
+        "their own Atlassian account, and reports which of those contain Xray test data. It " +
+        "does NOT search, read, or return any test, issue, or test-run content -- only project " +
+        "names, keys, and whether Xray tests exist. Use it when the user asks which Jira or " +
+        "Xray projects they have access to, or asks you to check that the Jira/Xray connection " +
+        "is working.",
+      inputSchema: {
+        type: "object",
+        properties: {},
+        additionalProperties: false,
+      },
+    },
+
+    async run(): Promise<AgentToolResult> {
+      if (!isAtlassianConfigured()) return atlassianNotConfiguredResult();
+
+      // Whose Jira account is this running as? Nothing below spends a
+      // credential before this resolves. Same gate, and the same reasoning, as
+      // resolveGitHubToken in src/tools/github-access.ts.
+      const acting = await identity.resolve();
+      if (!acting.ok) {
+        log.warn(`jira-xray: refusing -- acting identity ${acting.reason}`);
+        return identityRefusalResult(acting.reason);
+      }
+
+      const userId = acting.userId as string;
+      const auth = await getValidAccessToken(userId, log);
+      if (!auth.ok) return needsAuthResult(auth.reason);
+
+      const accessToken = auth.token as string;
+
+      // --- The cloud id: the step GitHub has no equivalent of ---------------
+      let cloudId = auth.cloudId;
+      let siteName = auth.siteName;
+      if (!cloudId) {
+        try {
+          const site = await getAccessibleJiraSite(userId, accessToken, log);
+          if (!site) return noAccessibleSiteResult();
+          cloudId = site.id;
+          siteName = site.url || site.name;
+        } catch (err) {
+          log.error("jira-xray: accessible-resources lookup failed", describeError(err), err);
+          return jiraFailureResult("finding which Jira site this account can use", err);
+        }
+      }
+
+      // --- The user's real projects, on the user's own token ----------------
+      let projects: JiraProject[];
+      let truncated = false;
+      try {
+        const page = await fetchProjects(cloudId, accessToken, log);
+        projects = page.projects;
+        truncated = page.truncated;
+      } catch (err) {
+        log.error("jira-xray: project search failed", describeError(err), err);
+        return jiraFailureResult("listing this user's Jira projects", err);
+      }
+
+      if (projects.length === 0) return noProjectsResult(siteName);
+
+      // --- The Xray check, on the shared service credential -----------------
+      const statuses = await checkXray(projects, log);
+
+      printToConsole(statuses, siteName, auth.displayName, truncated);
+
+      return { content: formatForModel(statuses, siteName, auth.displayName, truncated) };
+    },
+  };
+}
+
+/**
+ * Pages through GET /rest/api/3/project/search on the user's own bearer token.
+ *
+ * WHAT MAKES THIS THE RIGHT ENDPOINT. It returns only projects the caller has
+ * the Browse Projects permission on -- Jira does the filtering, not Knowva, so
+ * there is no list to trim and no chance of trimming it wrongly. `read:jira-work`
+ * is the scope that covers it.
+ *
+ * Note the base URL shape: every Jira call on a 3LO token goes through
+ * api.atlassian.com/ex/jira/{cloudId}, never the site's own hostname. Calling
+ * https://yoursite.atlassian.net/rest/... with this token fails, and it fails
+ * in a way that looks like a permissions problem rather than a routing one.
+ */
+async function fetchProjects(
+  cloudId: string,
+  accessToken: string,
+  log: ILogger
+): Promise<{ projects: JiraProject[]; truncated: boolean }> {
+  const collected: JiraProject[] = [];
+  let startAt = 0;
+  // Set only when Jira says there is another page AND the cap stopped us. The
+  // naive test -- collected.length > MAX_PROJECTS -- is wrong at the boundary:
+  // stopping on exactly MAX_PROJECTS with more pages behind it would report a
+  // complete list, and the model would then tell the user these are all their
+  // projects when they are not.
+  let truncated = false;
+
+  for (;;) {
+    const url =
+      `https://api.atlassian.com/ex/jira/${encodeURIComponent(cloudId)}` +
+      `/rest/api/3/project/search?startAt=${startAt}&maxResults=${PAGE_SIZE}&orderBy=key`;
+
+    const response = await fetch(url, {
+      headers: { Authorization: `Bearer ${accessToken}`, Accept: "application/json" },
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
+
+    if (!response.ok) {
+      const body = await response.text().catch(() => "");
+      throw new Error(
+        `Jira project search returned HTTP ${response.status} ${response.statusText}` +
+          (body ? `: ${body.slice(0, 300)}` : "")
+      );
+    }
+
+    const page = (await response.json()) as {
+      isLast?: boolean;
+      values?: Array<{ id?: string; key?: string; name?: string; projectTypeKey?: string }>;
+    };
+
+    for (const value of page.values || []) {
+      if (!value.id || !value.key) continue;
+      collected.push({
+        id: String(value.id),
+        key: value.key,
+        name: value.name || value.key,
+        projectTypeKey: value.projectTypeKey,
+      });
+    }
+
+    if (page.isLast !== false) break;
+    if (collected.length >= MAX_PROJECTS) {
+      truncated = true;
+      break;
+    }
+    startAt += PAGE_SIZE;
+  }
+
+  if (collected.length > MAX_PROJECTS) truncated = true;
+
+  log.info(
+    `jira-xray: Jira returned ${collected.length} accessible project(s)` +
+      (truncated ? ` (more exist; capped at ${MAX_PROJECTS})` : "")
+  );
+
+  return { projects: collected.slice(0, MAX_PROJECTS), truncated };
+}
+
+/**
+ * Asks Xray about each project, one call each.
+ *
+ * SEQUENTIAL, NOT PARALLEL, and that is a choice rather than an oversight.
+ * Fifty concurrent GraphQL calls against a 300-per-5-minutes budget is a good
+ * way to get the shared credential throttled for everybody at once, and the
+ * whole point of a shared credential is that one user's turn must not degrade
+ * the next user's.
+ *
+ * A credential-level failure stops the loop: if authenticating failed once it
+ * will fail identically fifty times, and the remaining projects are reported as
+ * unchecked rather than as having no tests. Reporting "no Xray data" because
+ * the service credential is broken would be a lie the user could not detect.
+ */
+async function checkXray(projects: JiraProject[], log: ILogger): Promise<ProjectXrayStatus[]> {
+  const statuses: ProjectXrayStatus[] = [];
+
+  if (!isXrayConfigured()) {
+    log.warn("jira-xray: no Xray service credential configured; reporting projects unchecked");
+    return projects.map((project) => ({ project, failure: "not-configured" as XrayFailure }));
+  }
+
+  let credentialFailure: { failure: XrayFailure; detail?: string } | undefined;
+
+  for (const project of projects) {
+    if (credentialFailure) {
+      statuses.push({ project, ...credentialFailure });
+      continue;
+    }
+
+    const result = await checkXrayProject(project.id, log);
+
+    if (result.ok) {
+      statuses.push({ project, testCount: result.testCount });
+      continue;
+    }
+
+    if (result.reason === "auth-failed" || result.reason === "not-configured") {
+      credentialFailure = { failure: result.reason, detail: result.detail };
+      statuses.push({ project, ...credentialFailure });
+      continue;
+    }
+
+    statuses.push({ project, failure: result.reason, detail: result.detail });
+  }
+
+  return statuses;
+}
+
+/**
+ * Prints the result to the terminal.
+ *
+ * Explicitly console.log rather than the structured logger, because this
+ * milestone is verified by reading it. Deliberately plain: aligned columns, no
+ * colour codes, nothing that depends on a particular terminal.
+ */
+function printToConsole(
+  statuses: ProjectXrayStatus[],
+  siteName: string | undefined,
+  displayName: string | undefined,
+  truncated: boolean
+): void {
+  const withTests = statuses.filter((s) => (s.testCount || 0) > 0);
+  const unchecked = statuses.filter((s) => s.failure);
+
+  const keyWidth = Math.max(3, ...statuses.map((s) => s.project.key.length));
+
+  const lines: string[] = [
+    "",
+    "=".repeat(72),
+    "list_accessible_projects" +
+      (displayName ? ` -- as ${displayName}` : "") +
+      (siteName ? ` on ${siteName}` : ""),
+    "=".repeat(72),
+    `Jira projects this user can access: ${statuses.length}` +
+      (truncated ? ` (capped at ${MAX_PROJECTS}; there are more)` : ""),
+    "",
+    `  ${"KEY".padEnd(keyWidth)}  ${"XRAY".padEnd(12)}  NAME`,
+    `  ${"-".repeat(keyWidth)}  ${"-".repeat(12)}  ${"-".repeat(24)}`,
+  ];
+
+  for (const status of statuses) {
+    lines.push(
+      `  ${status.project.key.padEnd(keyWidth)}  ` +
+        `${xrayCell(status).padEnd(12)}  ${status.project.name}`
+    );
+  }
+
+  lines.push(
+    "",
+    `With Xray test data: ${withTests.length}` +
+      (withTests.length > 0
+        ? ` (${withTests.map((s) => s.project.key).join(", ")})`
+        : ""),
+    `Without Xray test data: ${statuses.length - withTests.length - unchecked.length}`,
+    `Could not be checked: ${unchecked.length}` +
+      (unchecked.length > 0 ? ` (${unchecked.map((s) => s.project.key).join(", ")})` : "")
+  );
+
+  if (unchecked.length > 0) {
+    // One line naming the actual cause, so a broken service credential is not
+    // mistaken for fifty projects that happen to have no tests.
+    const first = unchecked[0];
+    lines.push(
+      `  reason: ${first.failure}${first.detail ? ` -- ${first.detail}` : ""}`
+    );
+  }
+
+  lines.push("=".repeat(72), "");
+
+  console.log(lines.join("\n"));
+}
+
+function xrayCell(status: ProjectXrayStatus): string {
+  if (status.failure) return "unchecked";
+  const count = status.testCount || 0;
+  return count > 0 ? `yes (${count})` : "no";
+}
+
+/**
+ * The same result, phrased for the model.
+ *
+ * The caveats are load-bearing. Without the one about the shared credential the
+ * model will report "no Xray tests" as settled fact, when what it actually
+ * knows is "the Xray service account saw no tests" -- which differs whenever
+ * that account's Jira permissions differ from the asking user's.
+ */
+function formatForModel(
+  statuses: ProjectXrayStatus[],
+  siteName: string | undefined,
+  displayName: string | undefined,
+  truncated: boolean
+): string {
+  const withTests = statuses.filter((s) => (s.testCount || 0) > 0);
+  const withoutTests = statuses.filter((s) => !s.failure && (s.testCount || 0) === 0);
+  const unchecked = statuses.filter((s) => s.failure);
+
+  const lines: string[] = [
+    `Jira projects accessible to this user${displayName ? ` (Atlassian account ${displayName})` : ""}` +
+      `${siteName ? ` on ${siteName}` : ""}: ${statuses.length}.` +
+      (truncated
+        ? ` Only the first ${MAX_PROJECTS} were checked -- this user has more, so do not present ` +
+          "this as a complete list."
+        : ""),
+    "",
+    "Projects WITH Xray test data:",
+    withTests.length > 0
+      ? withTests
+          .map((s) => `- ${s.project.key} (${s.project.name}) -- ${s.testCount} Xray test(s)`)
+          .join("\n")
+      : "- none",
+    "",
+    "Projects with NO Xray test data:",
+    withoutTests.length > 0
+      ? withoutTests.map((s) => `- ${s.project.key} (${s.project.name})`).join("\n")
+      : "- none",
+  ];
+
+  if (unchecked.length > 0) {
+    lines.push(
+      "",
+      "Projects that could NOT be checked for Xray data (this is not the same as having none -- " +
+        "say so explicitly):",
+      unchecked
+        .map(
+          (s) =>
+            `- ${s.project.key} (${s.project.name}) -- ${describeXrayFailure(s.failure, s.detail)}`
+        )
+        .join("\n")
+    );
+  }
+
+  lines.push(
+    "",
+    "How to report this: the Jira project list is exactly what this user's own Atlassian account " +
+      "can see, so it is authoritative for them and for nobody else. The Xray check runs on a " +
+      "shared service account rather than on their account, because Xray Cloud has no per-user " +
+      "API access at all -- so 'no Xray test data' means that service account found none, which " +
+      "can differ from what this user would see in Xray. Mention that only if it matters to the " +
+      "answer. List the projects plainly; do not invent test names, counts you were not given, " +
+      "or anything about what the tests contain -- you have not seen any test content."
+  );
+
+  return lines.join("\n");
+}
+
+function describeXrayFailure(failure: XrayFailure | undefined, detail: string | undefined): string {
+  const base =
+    failure === "not-configured"
+      ? "Xray is not configured on this deployment"
+      : failure === "auth-failed"
+        ? "the shared Xray service credential was rejected (a setup problem on our side, NOT " +
+          "this user's sign-in)"
+        : failure === "unknown-project"
+          ? "Xray does not recognise this project, or it has no Xray configuration"
+          : failure === "query-error"
+            ? "Xray rejected the query"
+            : "Xray could not be reached";
+  return detail ? `${base}: ${detail}` : base;
+}
+
+// --- Error results -------------------------------------------------------
+//
+// Same division as src/tools/github-access.ts: ready-made AgentToolResults, so
+// the tool body stays readable and each distinct failure gets its own wording.
+// These live here rather than in a shared access module because there is only
+// one Atlassian tool today. When a second arrives (search_xray_tests, say),
+// lift the token gate and these results into src/tools/atlassian-access.ts,
+// exactly as github-access.ts was lifted out when get_repo_content joined
+// search_github.
+
+function atlassianNotConfiguredResult(): AgentToolResult {
+  return {
+    content:
+      "Jira isn't set up on this deployment -- Knowva has no Atlassian OAuth app configured. " +
+      "Tell the user it's a setup problem on our side, not something they did.",
+    isError: true,
+  };
+}
+
+function identityRefusalResult(reason: string | undefined): AgentToolResult {
+  return {
+    content:
+      reason === "mismatch"
+        ? "Knowva could not safely establish whose Jira account to act as, so it did nothing. " +
+          "This is a safety stop. Tell the user something is wrong with their sign-in and to " +
+          "sign out and back in."
+        : "Knowva could not confirm who it would be acting as in Jira, so it did nothing. This " +
+          "is a safety stop, not a permissions problem. Tell the user to sign out and sign back " +
+          "in, then try again.",
+    isError: true,
+  };
+}
+
+/**
+ * The "sign in first" result: prose for the model, plus the signal that makes
+ * app.ts attach a sign-in card. Mirrors needsAuthResult in
+ * src/tools/github-access.ts, including keeping the reasons apart -- "connect
+ * Jira" and "your connection expired" read very differently to somebody who
+ * connected it an hour ago.
+ */
+function needsAuthResult(reason: AtlassianTokenFailure | undefined): AgentToolResult {
+  if (reason === "not-configured") return atlassianNotConfiguredResult();
+
+  const explanation =
+    reason === "session-expired"
+      ? "This user's Jira connection has expired and cannot be renewed automatically, so nothing " +
+        "was fetched."
+      : reason === "refresh-failed"
+        ? "This user's Jira connection could not be renewed, so nothing was fetched."
+        : "This user hasn't connected their Atlassian account yet, so nothing was fetched.";
+
+  return {
+    // No URL in here on purpose -- the card carries it.
+    content:
+      explanation +
+      " Knowva is showing them a sign-in button, so do NOT paste a link or invent one. Tell them " +
+      "briefly that you need them to connect Jira first and that there's a button just below " +
+      "your message, then stop. Say nothing about which projects they might have -- you fetched " +
+      "nothing. Note this is an Atlassian sign-in, entirely separate from their Microsoft Teams " +
+      "sign-in and from GitHub.",
+    signal: { kind: "needs-auth", provider: "atlassian" },
+  };
+}
+
+function noAccessibleSiteResult(): AgentToolResult {
+  return {
+    content:
+      "This user's Atlassian account is connected, but it granted Knowva access to no Jira site. " +
+      "That usually means they authorized the connection without selecting a site, or they have " +
+      "no Jira site on their Atlassian account. Tell them to disconnect and connect again, " +
+      "choosing their Jira site on the Atlassian grant screen. Do not list any projects -- there " +
+      "are none to list.",
+    isError: true,
+  };
+}
+
+function noProjectsResult(siteName: string | undefined): AgentToolResult {
+  return {
+    content:
+      `This user's Atlassian account${siteName ? ` on ${siteName}` : ""} can browse no Jira ` +
+      "projects at all. That is a real answer, not a failure: Jira returned an empty list " +
+      "because they have the Browse Projects permission on nothing. Tell them plainly, and " +
+      "suggest they check with whoever administers their Jira site. Do not name any project -- " +
+      "you were given none.",
+  };
+}
+
+function jiraFailureResult(what: string, err: unknown): AgentToolResult {
+  const message = (err as any)?.message;
+  return {
+    content:
+      `Knowva couldn't reach Jira while ${what}. Tell the user it's a problem on our side, not ` +
+      "theirs, and to try again shortly. Do not guess at which projects they have." +
+      (message ? ` (Technical detail, not for the user: ${message})` : ""),
+    isError: true,
+  };
+}

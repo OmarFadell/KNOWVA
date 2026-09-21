@@ -100,6 +100,18 @@ deploy:
         # unavailable instead of the app refusing to start.
         GITHUB_CLIENT_ID: ${{SECRET_GITHUB_CLIENT_ID}}
         GITHUB_CLIENT_SECRET: ${{SECRET_GITHUB_CLIENT_SECRET}}
+        # PARKED. Credentials for the per-user Atlassian OAuth flow in
+        # src/auth/atlassian.ts, which app.ts does not currently mount -- the
+        # Xray milestone is org-scoped. Carried through so reviving it needs no
+        # plumbing change; empty values are expected and harmless.
+        ATLASSIAN_CLIENT_ID: ${{SECRET_ATLASSIAN_CLIENT_ID}}
+        ATLASSIAN_CLIENT_SECRET: ${{SECRET_ATLASSIAN_CLIENT_SECRET}}
+        # Xray Cloud API key. ONE SHARED SERVICE CREDENTIAL for the whole
+        # deployment, not per user -- Xray Cloud has no per-user auth model at
+        # all. The id half is plain config in env/.env.local; the secret half is
+        # decrypted from env/.env.local.user. See src/xray/client.ts.
+        XRAY_CLIENT_ID: ${{XRAY_CLIENT_ID}}
+        XRAY_CLIENT_SECRET: ${{SECRET_XRAY_CLIENT_SECRET}}
         # Extra root CA for Node's TLS trust store. The path is machine-specific,
         # so it is set in env/.env.local (gitignored) and this line only carries
         # it through to .localConfigs, where env-cmd puts it into the process

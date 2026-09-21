@@ -42,11 +42,20 @@ import type {
  * drive the UI; a tool that can express itself in text should.
  * ---------------------------------------------------------------------------
  */
+/**
+ * The external services a user can be asked to authorize.
+ *
+ * Kept as a named union rather than a bare string so that adding a provider is
+ * a compile error everywhere it needs handling -- in particular the registry in
+ * src/teams/signin-cards.ts, which must have an entry for every member.
+ */
+export type AuthProvider = "github" | "atlassian";
+
 export type AgentToolSignal = {
   /** The user must authorize an external service before this tool can work. */
   kind: "needs-auth";
   /** Which service, so the response layer knows which sign-in to offer. */
-  provider: "github";
+  provider: AuthProvider;
 };
 
 export interface AgentToolResult {

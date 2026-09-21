@@ -41,6 +41,12 @@
     "githubClientSecret": {
       "value": "${{SECRET_GITHUB_CLIENT_SECRET}}"
     },
+    "xrayClientId": {
+      "value": "${{XRAY_CLIENT_ID}}"
+    },
+    "xrayClientSecret": {
+      "value": "${{SECRET_XRAY_CLIENT_SECRET}}"
+    },
     "teamsAppId": {
       "value": "${{TEAMS_APP_ID}}"
     }

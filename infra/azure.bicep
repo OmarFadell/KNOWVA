@@ -46,6 +46,13 @@ param githubClientId string = ''
 @description('GitHub App client secret (SECRET_GITHUB_CLIENT_SECRET). Marked @secure() so it is redacted from deployment history and portal output. Key Vault is the eventual home, same as the Anthropic key.')
 param githubClientSecret string = ''
 
+@description('Xray Cloud API key client id (XRAY_CLIENT_ID) for the list_xray_projects tool. ONE SHARED SERVICE CREDENTIAL for the whole deployment, not a per-user value -- Xray Cloud has no per-user auth model at all. Empty disables the tool, which then says so in plain language rather than the app failing to start.')
+param xrayClientId string = ''
+
+@secure()
+@description('Xray Cloud API key client secret (SECRET_XRAY_CLIENT_SECRET). Marked @secure() so it is redacted from deployment history and portal output. Key Vault is the eventual home, same as the Anthropic key.')
+param xrayClientSecret string = ''
+
 @description('Optional shared/project mailboxes search_emails may be pointed at (SHARED_MAILBOXES), as "Display Name=address@domain" pairs separated by ";". Not a secret. Empty is the intended default: with nothing here, the email tools can only ever reach the mailbox of whoever is asking. Naming a mailbox grants nothing by itself -- every read still runs on that user delegated token under Mail.Read.Shared, so Exchange decides per user whether they may open it.')
 param sharedMailboxes string = ''
 
@@ -144,6 +151,17 @@ resource webApp 'Microsoft.Web/sites@2021-02-01' = {
         {
           name: 'GITHUB_CLIENT_SECRET'
           value: githubClientSecret
+        }
+        // Xray Cloud. One shared service credential, and it is the only bound
+        // on what the tool reports -- see the parameter descriptions above for
+        // why this one is deliberately not per-user.
+        {
+          name: 'XRAY_CLIENT_ID'
+          value: xrayClientId
+        }
+        {
+          name: 'XRAY_CLIENT_SECRET'
+          value: xrayClientSecret
         }
         // The public origin the GitHub OAuth callback comes back to. config.ts
         // derives the full callback URL from it, and it must match a Callback

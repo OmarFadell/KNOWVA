@@ -75,12 +75,26 @@ function parseSharedMailboxes(raw: string | undefined): SharedMailbox[] {
 }
 
 /**
- * Works out the public origin the GitHub OAuth callback will arrive on.
- * Returns "" when nothing is known, which src/auth/github.ts reports as
- * "GitHub sign-in is not configured" rather than building a broken URL.
+ * Works out the public origin an OAuth callback will arrive on.
+ *
+ * ONE FUNCTION FOR EVERY PROVIDER, ON PURPOSE. This started as
+ * resolveGitHubOrigin and was generalised when Atlassian became the second
+ * OAuth provider, rather than copied. A second copy would have been a second
+ * place for the redirect URI to drift away from the tunnel host -- which has
+ * already cost this project once -- and a redirect URI that disagrees with the
+ * registered one fails at the provider with a message that reads like a bad
+ * client id.
+ *
+ * `overrideEnvName` is the per-provider escape hatch (GITHUB_OAUTH_ORIGIN,
+ * ATLASSIAN_OAUTH_ORIGIN) for the case where a callback has to arrive somewhere
+ * other than the bot's own endpoint. Everything else is shared: BOT_ENDPOINT
+ * locally, BOT_DOMAIN on Azure.
+ *
+ * Returns "" when nothing is known, which each auth module reports as "sign-in
+ * is not configured" rather than building a broken URL.
  */
-function resolveGitHubOrigin(): string {
-  const explicit = process.env.GITHUB_OAUTH_ORIGIN?.trim();
+function resolveOAuthOrigin(overrideEnvName: string): string {
+  const explicit = process.env[overrideEnvName]?.trim();
   if (explicit) return explicit.replace(/\/+$/, "");
 
   // Local: the debug task writes the dev-tunnel URL here, scheme included.
@@ -173,7 +187,68 @@ const config = {
      * tunnel hostname changes every time the tunnel is recreated -- see
      * src/auth/github.ts for what that means in practice.
      */
-    oauthOrigin: resolveGitHubOrigin(),
+    oauthOrigin: resolveOAuthOrigin("GITHUB_OAUTH_ORIGIN"),
+  },
+
+  /**
+   * Atlassian. PARKED -- read by src/auth/atlassian.ts, which app.ts does not
+   * currently mount. The Xray milestone is org-scoped (one shared service
+   * credential plus an admin-set project list), so there is no per-user Jira
+   * sign-in to ask anybody for yet. Kept because the 3LO flow is complete and
+   * verified, and a future "read Jira as the asking user" tool needs it.
+   *
+   * Optional in exactly the same way as `github` above: a deployment with no
+   * Atlassian OAuth app starts fine.
+   *
+   * SECRET NAMES. The app reads ATLASSIAN_CLIENT_ID / ATLASSIAN_CLIENT_SECRET,
+   * which m365agents.local.yml writes into .localConfigs from
+   * SECRET_ATLASSIAN_CLIENT_ID / SECRET_ATLASSIAN_CLIENT_SECRET in
+   * env/.env.local.user -- the same indirection GITHUB_CLIENT_ID already uses.
+   */
+  atlassian: {
+    clientId: process.env.ATLASSIAN_CLIENT_ID || "",
+    clientSecret: process.env.ATLASSIAN_CLIENT_SECRET || "",
+    /**
+     * Public origin the Atlassian OAuth callback lands on, no trailing slash.
+     * Derived from BOT_ENDPOINT / BOT_DOMAIN by the shared resolver above --
+     * NOT configured separately, and not derived independently.
+     *
+     * THIS MUST MATCH THE CALLBACK URL ON THE ATLASSIAN APP, and unlike a
+     * GitHub App, an Atlassian OAuth 2.0 integration accepts only ONE. A
+     * recreated dev tunnel therefore means editing that single field, not
+     * adding to a list -- see src/auth/atlassian.ts.
+     */
+    oauthOrigin: resolveOAuthOrigin("ATLASSIAN_OAUTH_ORIGIN"),
+  },
+
+  /**
+   * Xray Cloud, for the list_xray_projects tool.
+   *
+   * ONE SHARED SERVICE CREDENTIAL, AND THAT IS NOT AN INCONSISTENCY. Xray Cloud
+   * authenticates with a Client ID / Client Secret pair from an API Key in its
+   * Global Settings, and offers no per-user or delegated auth of any kind. So
+   * unlike every other credential here, this one identifies the deployment
+   * rather than a person.
+   *
+   * THE CREDENTIAL IS THE ENTIRE CONFIGURATION. There is no project list. An
+   * earlier design took an admin-set XRAY_PROJECTS allowlist; it was removed
+   * deliberately, and the tool now discovers projects from Xray itself. So what
+   * Knowva reports is exactly what this API key can see -- no more, no less.
+   * Whoever issues the key is making the disclosure decision, because Xray
+   * applies that key's own permissions and nothing narrows it afterwards.
+   *
+   * XRAY_CLIENT_ID is plain config (env/.env.local, env/.env.dev); the secret
+   * half comes from SECRET_XRAY_CLIENT_SECRET in env/.env.local.user locally
+   * and from the xrayClientSecret @secure() Bicep parameter on Azure.
+   *
+   * THE BASE URL IS FIXED and not configurable. Xray Cloud does publish
+   * regional hostnames (us./eu./au.xray.cloud.getxray.app), but the apex host
+   * routes correctly for every tenant and one fixed value is one less thing to
+   * get wrong per environment. It lives in src/xray/client.ts as a constant.
+   */
+  xray: {
+    clientId: process.env.XRAY_CLIENT_ID || "",
+    clientSecret: process.env.XRAY_CLIENT_SECRET || "",
   },
 
   // Optional, and deliberately so. With this unset, search_emails can only ever
